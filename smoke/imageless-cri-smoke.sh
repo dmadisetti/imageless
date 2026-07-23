@@ -164,11 +164,27 @@ MAIN=$("${CRICTL[@]}" create --no-pull "$POD" "$WORK/main.json" "$WORK/pod.json"
 "${CRICTL[@]}" start "$MAIN" >/dev/null
 [[ -L $(root_for_container "$MAIN") ]]
 
+# A selected container whose workload cannot exec is still resolved (the
+# selector/materializer ran, as for init/main) but must not end up running.
+# Assert on the resulting container STATE, not on `start`'s exit code: newer
+# containerd unblocks the container via the exec fifo and returns success from
+# `start` before the final execve, so a missing binary surfaces as an immediate
+# non-zero EXIT rather than a start error (older containerd reported it
+# synchronously — that timing difference is what made this flaky).
 FAILED=$("${CRICTL[@]}" create --no-pull "$POD" "$WORK/failed.json" "$WORK/pod.json")
-if "${CRICTL[@]}" start "$FAILED" >/dev/null 2>&1; then
-  echo "expected failed workload start to fail" >&2
+"${CRICTL[@]}" start "$FAILED" >/dev/null 2>&1 || true
+FAILED_STATE=''
+for _ in $(seq 1 50); do
+  FAILED_STATE=$("${CRICTL[@]}" inspect --output json "$FAILED" | jq -r '.status.state')
+  [[ $FAILED_STATE == CONTAINER_EXITED ]] && break
+  sleep 0.1
+done
+[[ $FAILED_STATE == CONTAINER_EXITED ]] || {
+  echo "failed workload never exited (state: $FAILED_STATE)" >&2
   exit 1
-fi
+}
+FAILED_CODE=$("${CRICTL[@]}" inspect --output json "$FAILED" | jq -r '.status.exitCode')
+[[ $FAILED_CODE != 0 ]] || { echo "failed workload exited 0, expected non-zero" >&2; exit 1; }
 cleanup_container "$FAILED"
 
 # Exercise normal successful delete before creating the reboot witness.
