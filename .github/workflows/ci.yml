@@ -56,6 +56,6 @@ jobs:
       - name: require KVM
         run: test -e /dev/kvm || { echo "::error::/dev/kvm missing — acceptance gates cannot run"; exit 1; }
       - name: docker embedded-layer gate (daemonless, in-process materializer)
-        run: nix build -L .#checks.x86_64-linux.docker-embedded-smoke
+        run: nix build -L .#docker-embedded-smoke
       - name: CRI lifecycle gate (resolver-daemon materializer)
         run: nix build -L .#imageless-cri-vm

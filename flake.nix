@@ -459,8 +459,16 @@
             pkgs.writeText "imageless-module-eval" "ok";
         in
         # Every package is a check (a package that doesn't build is a broken
-        # release), plus the gates only checks carry.
-        self.packages.${system} // {
+        # release), plus the lint/module-eval gates only checks carry. The two
+        # NixOS VM gates are excluded: they seed a buildable .drv into the
+        # guest via virtualisation.additionalPaths, which `nix flake check`
+        # cannot evaluate on a fresh store (closureInfo needs the .drv already
+        # valid). They are built directly — as packages — by the KVM
+        # acceptance-gates CI job, which is where VM tests belong.
+        (builtins.removeAttrs self.packages.${system} [
+          "docker-embedded-smoke"
+          "imageless-cri-vm"
+        ]) // {
           inherit lint module-eval;
         });
 
