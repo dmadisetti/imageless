@@ -1,0 +1,61 @@
+# All actions are pinned to full commit SHAs (tags are mutable; SHAs are not).
+#   actions/checkout 11bd719...        == v4.2.2
+#   cachix/install-nix-action 630ae54... == v31
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Lint + module eval + every package except the VM gates. A package that
+  # does not build is a broken release, so packages ARE checks.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342
+      - name: flake metadata is locked
+        run: nix flake metadata --no-update-lock-file
+      - name: eval-only check
+        run: nix flake check --no-build
+      - name: lint (rustfmt + clippy -D warnings)
+        run: nix build -L .#checks.x86_64-linux.lint
+      - name: module eval assertions
+        run: nix build -L .#checks.x86_64-linux.module-eval
+      - name: packages (workspace build runs cargo test)
+        run: |
+          nix build -L \
+            .#imageless \
+            .#imageless-runc \
+            .#imageless-resolver \
+            .#docker-embedded-seed \
+            .#docker-embedded-image \
+            .#docker-passthrough-image \
+            .#placeholder-image \
+            .#smoke-image \
+            .#smoke-rootfs \
+            .#smoke-release \
+            .#imageless-cri-smoke \
+            .#stock-oci-smoke
+
+  # The two acceptance gates are NixOS VM tests and need KVM. GitHub-hosted
+  # Linux runners expose /dev/kvm; the guard below fails LOUDLY if that ever
+  # stops being true — we do not silently skip the gates that define
+  # conformance (SPEC.md §7).
+  acceptance-gates:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342
+      - name: require KVM
+        run: test -e /dev/kvm || { echo "::error::/dev/kvm missing — acceptance gates cannot run"; exit 1; }
+      - name: docker embedded-layer gate (daemonless, in-process materializer)
+        run: nix build -L .#checks.x86_64-linux.docker-embedded-smoke
+      - name: CRI lifecycle gate (resolver-daemon materializer)
+        run: nix build -L .#imageless-cri-vm
