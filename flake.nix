@@ -194,7 +194,13 @@
             ];
             text = ''
               export IMAGELESS_SMOKE_IMAGE_ARCHIVE=${smoke-image}
-              export IMAGELESS_SMOKE_ROOTFS_DRV=${builtins.unsafeDiscardStringContext smoke-rootfs.drvPath}
+              # Keep the .drv's string context: the smoke realizes this
+              # derivation IN the guest, so imageless-cri-smoke must carry it as
+              # an instantiation dependency (the .drv file, not its output).
+              # Discarding context left the path as a bare string that Nix's
+              # reference scanner still picked up — an uninstantiated .drv that
+              # broke `closureInfo`/`nix flake check` on a fresh store.
+              export IMAGELESS_SMOKE_ROOTFS_DRV=${smoke-rootfs.drvPath}
               export IMAGELESS_SMOKE_RELEASE_REFERENCE=${smoke-release.reference}
               ${builtins.readFile ./smoke/imageless-cri-smoke.sh}
             '';
