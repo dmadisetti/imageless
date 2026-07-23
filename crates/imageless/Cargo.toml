@@ -6,6 +6,13 @@ authors.workspace = true
 license.workspace = true
 description = "Materialize a Nix flake carried in OCI image layers into the container rootfs at create time"
 
+[features]
+# Off by default: a production build cannot read a policy from the environment.
+# Enabling this compiles in the `IMAGELESS_POLICY_JSON` inline-policy path, whose
+# trust anchor is the daemon environment rather than a file's ownership. Intended
+# for local/dev hosts (e.g. the dev Docker harness), never for a shared node.
+inline-policy = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

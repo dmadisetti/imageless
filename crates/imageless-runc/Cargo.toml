@@ -10,5 +10,11 @@ description = "runc-compatible imageless interposer for Docker and other OCI cal
 name = "imageless-runc"
 path = "src/main.rs"
 
+[features]
+# Forwards to `imageless/inline-policy`. Build the interposer with
+# `--features inline-policy` for a dev host that supplies policy via
+# `IMAGELESS_POLICY_JSON`; leave it off for production nodes.
+inline-policy = ["imageless/inline-policy"]
+
 [dependencies]
 imageless = { path = "../imageless" }

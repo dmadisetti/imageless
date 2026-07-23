@@ -1,0 +1,17 @@
+{
+  "runtimes": {
+    "imageless": {
+      "path": "imageless-runc"
+    }
+  },
+  "data-root": "/tmp/imageless-docker-dev/data",
+  "exec-root": "/tmp/imageless-docker-dev/exec",
+  "pidfile": "/tmp/imageless-docker-dev/docker.pid",
+  "hosts": [
+    "unix:///tmp/imageless-docker-dev/docker.sock"
+  ],
+  "storage-driver": "vfs",
+  "iptables": false,
+  "ip6tables": false,
+  "bridge": "none"
+}

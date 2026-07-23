@@ -15,11 +15,18 @@
 , nix
 , gitMinimal
 , cacert
+  # Compile in the `IMAGELESS_POLICY_JSON` inline-policy path (see the crate
+  # feature of the same name). Off for production nodes; the dev Docker harness
+  # builds `.#imageless-dev` with it enabled so a root daemon can be handed a
+  # policy through its environment instead of an ownership-checked file.
+, inlinePolicy ? false
 }:
 
 rustPlatform.buildRustPackage {
-  pname = "imageless";
+  pname = if inlinePolicy then "imageless-dev" else "imageless";
   version = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version;
+
+  buildFeatures = lib.optional inlinePolicy "imageless-runc/inline-policy";
 
   src = lib.fileset.toSource {
     root = ../.;

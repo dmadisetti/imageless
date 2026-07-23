@@ -35,6 +35,12 @@
           # points every consumer here.
           imageless = pkgs.callPackage ./nix/package.nix { };
 
+          # Same workspace built with the `inline-policy` feature, for the dev
+          # Docker harness only (a root daemon reads policy from
+          # `IMAGELESS_POLICY_JSON` — see dev/docker/README.md). Never deploy it
+          # to a shared node: production `.#imageless` cannot read env policy.
+          imageless-dev = pkgs.callPackage ./nix/package.nix { inlinePolicy = true; };
+
           # Single-binary views for the quick starts (`nix build .#imageless-runc`).
           binView = name: pkgs.runCommand name
             { meta.mainProgram = name; }
@@ -74,6 +80,35 @@
             copyToRoot = docker-embedded-seed;
             config = {
               Entrypoint = [ "/bin/busybox" "httpd" "-f" "-p" "18080" "-h" "/www" ];
+              ExposedPorts."18080/tcp" = { };
+            };
+          };
+
+          # A real dynamically-linked service (nginx) shipped the imageless
+          # way. The seed carries ONLY examples/nginx-embedded/{flake.nix,
+          # flake.lock} — no nginx, no closure, a few kilobytes with ZERO
+          # /nix/store references (so dockerTools cannot drag a closure into
+          # the layer). The node evaluates the embedded flake's SPARSE `#rootfs`
+          # at container-create, materializes nginx from its own cache, and
+          # binds /nix/store read-only (StoreProjection::Node) so the loader
+          # resolves. This exercises the true late-bound path — unlike the
+          # static-busybox seed above, which ships its own filesystem. nginx
+          # needs writable pid/temp dirs under the readonly root, so run it with
+          # `--tmpfs /tmp`.
+          nginx-embedded-seed = pkgs.runCommand "imageless-nginx-embedded-seed" { } ''
+            mkdir -p $out/etc/imageless
+            cp ${./examples/nginx-embedded/flake.nix} $out/etc/imageless/flake.nix
+            cp ${./examples/nginx-embedded/flake.lock} $out/etc/imageless/flake.lock
+          '';
+          nginx-embedded-image = pkgs.dockerTools.buildImage {
+            name = "localhost/imageless-nginx-embedded";
+            tag = "e2e";
+            copyToRoot = nginx-embedded-seed;
+            config = {
+              # -e redirects the compile-time default error log (opened before
+              # the config's error_log directive applies) off the read-only
+              # /var/log/nginx path to the container's stderr.
+              Entrypoint = [ "/bin/nginx" "-e" "/proc/self/fd/2" "-c" "/etc/nginx/nginx.conf" ];
               ExposedPorts."18080/tcp" = { };
             };
           };
@@ -375,8 +410,10 @@
           };
         in
         {
-          inherit imageless imageless-runc imageless-resolver;
+          inherit imageless imageless-dev imageless-runc imageless-resolver;
           inherit docker-embedded-seed docker-embedded-image docker-passthrough-image placeholder-image;
+          inherit nginx-embedded-seed nginx-embedded-image;
+          inherit docker-embedded-scenario;
           inherit docker-embedded-smoke imageless-cri-vm;
           inherit smoke-image smoke-rootfs smoke-release imageless-cri-smoke;
           inherit stock-oci-smoke;

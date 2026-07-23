@@ -7,7 +7,7 @@ use crate::materialize::{
 };
 use crate::mounts::{apply_node_store_projection, apply_store_mounts, store_projection_for};
 use crate::release::{ProcessMetadata, ResolvedRelease};
-use crate::resolver::resolve_in_process;
+use crate::resolver::{resolve_in_process, PolicySource};
 use crate::spec::expansion_request;
 use crate::{to_io, StoreProjection};
 use serde::Serialize;
@@ -20,35 +20,49 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// How a caller reaches materialization: through the node resolver daemon's
-/// UNIX socket, or in-process under the node policy file. In-process
-/// materialization runs as the calling user and provides no cross-process
-/// single-flight; the daemon remains the multi-tenant deployment shape.
+/// UNIX socket, or in-process under a node policy. In-process materialization
+/// runs as the calling user and provides no cross-process single-flight; the
+/// daemon remains the multi-tenant deployment shape. The in-process policy may
+/// come from a file or inline from the daemon environment — see [`PolicySource`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaterializerConfig {
     Socket(PathBuf),
-    InProcess { policy_path: Option<PathBuf> },
+    InProcess(PolicySource),
 }
 
 impl MaterializerConfig {
-    /// Environment-based selection for adapter binaries: a non-empty
-    /// `IMAGELESS_RESOLVER_SOCKET` selects the daemon socket; otherwise
-    /// materialization happens in-process, reading the policy file named by
-    /// `IMAGELESS_POLICY` (default `/etc/imageless/policy.json`).
+    /// Environment-based selection for adapter binaries, in precedence order:
+    /// a non-empty `IMAGELESS_RESOLVER_SOCKET` selects the daemon socket; else,
+    /// when built with the `inline-policy` feature, a non-empty
+    /// `IMAGELESS_POLICY_JSON` supplies the policy inline (no file to own,
+    /// trusted because the daemon operator set it); else materialization reads
+    /// the policy file named by `IMAGELESS_POLICY` (default
+    /// `/etc/imageless/policy.json`). Without the feature the inline path is not
+    /// compiled in, so a production binary can only ever load a policy file.
     pub fn from_environment() -> Self {
-        match std::env::var("IMAGELESS_RESOLVER_SOCKET") {
-            Ok(socket) if !socket.is_empty() => Self::Socket(PathBuf::from(socket)),
-            _ => Self::InProcess {
-                policy_path: std::env::var_os("IMAGELESS_POLICY")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from),
-            },
+        if let Ok(socket) = std::env::var("IMAGELESS_RESOLVER_SOCKET") {
+            if !socket.is_empty() {
+                return Self::Socket(PathBuf::from(socket));
+            }
         }
+        #[cfg(feature = "inline-policy")]
+        if let Some(json) = std::env::var("IMAGELESS_POLICY_JSON")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            return Self::InProcess(PolicySource::Inline(json));
+        }
+        Self::InProcess(PolicySource::File(
+            std::env::var_os("IMAGELESS_POLICY")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        ))
     }
 
     fn resolve(&self, request: &ResolveRequest) -> Result<ResolutionSuccess, ResolutionError> {
         match self {
             Self::Socket(socket_path) => request_resolution_detailed(socket_path, request),
-            Self::InProcess { policy_path } => resolve_in_process(policy_path.as_deref(), request),
+            Self::InProcess(source) => resolve_in_process(source, request),
         }
     }
 }
@@ -406,16 +420,39 @@ mod tests {
         std::env::set_var("IMAGELESS_RESOLVER_SOCKET", "");
         assert_eq!(
             MaterializerConfig::from_environment(),
-            MaterializerConfig::InProcess {
-                policy_path: Some(PathBuf::from("/etc/imageless/other-policy.json"))
-            }
+            MaterializerConfig::InProcess(PolicySource::File(Some(PathBuf::from(
+                "/etc/imageless/other-policy.json"
+            ))))
         );
+
+        // Inline policy JSON takes precedence over a policy file path: no file
+        // to own, trusted because it rides in the daemon environment. Only
+        // compiled in with the `inline-policy` feature.
+        #[cfg(feature = "inline-policy")]
+        {
+            std::env::set_var("IMAGELESS_POLICY_JSON", "{\"system\":\"x86_64-linux\"}");
+            assert_eq!(
+                MaterializerConfig::from_environment(),
+                MaterializerConfig::InProcess(PolicySource::Inline(
+                    "{\"system\":\"x86_64-linux\"}".to_string()
+                ))
+            );
+
+            // A daemon socket still outranks inline policy.
+            std::env::set_var("IMAGELESS_RESOLVER_SOCKET", "/run/imageless/test.sock");
+            assert_eq!(
+                MaterializerConfig::from_environment(),
+                MaterializerConfig::Socket(PathBuf::from("/run/imageless/test.sock"))
+            );
+            std::env::remove_var("IMAGELESS_POLICY_JSON");
+            std::env::remove_var("IMAGELESS_RESOLVER_SOCKET");
+        }
 
         std::env::remove_var("IMAGELESS_RESOLVER_SOCKET");
         std::env::remove_var("IMAGELESS_POLICY");
         assert_eq!(
             MaterializerConfig::from_environment(),
-            MaterializerConfig::InProcess { policy_path: None }
+            MaterializerConfig::InProcess(PolicySource::File(None))
         );
     }
 
@@ -436,9 +473,9 @@ mod tests {
             &dir,
             "rootfs",
             5,
-            &MaterializerConfig::InProcess {
-                policy_path: Some(PathBuf::from("/nonexistent/imageless-policy.json")),
-            },
+            &MaterializerConfig::InProcess(PolicySource::File(Some(PathBuf::from(
+                "/nonexistent/imageless-policy.json",
+            )))),
         )
         .unwrap();
         assert!(result.is_none());

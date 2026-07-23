@@ -34,6 +34,29 @@ use std::time::{Duration, Instant};
 /// `IMAGELESS_POLICY` does not name another location.
 pub const DEFAULT_POLICY_PATH: &str = "/etc/imageless/policy.json";
 
+/// Where in-process materialization reads its node policy from. Both variants
+/// carry the same trust as whoever supplies them: a file gated by the
+/// [`load_resolver_policy`] ownership check, or inline JSON handed in through
+/// the daemon environment. The file exists so the loader has an ownership
+/// anchor; when the operator sets the daemon's environment instead, that
+/// environment is an equivalent anchor and nothing needs to land on disk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolicySource {
+    /// A policy file: `Some(path)` loads that exact file and never defaults;
+    /// `None` consults the node default path, which falls back to a
+    /// fail-closed cache-only policy when the file is absent.
+    File(Option<PathBuf>),
+    /// Inline policy JSON supplied out-of-band (e.g. `IMAGELESS_POLICY_JSON`).
+    /// There is no file to own, so the ownership check does not apply; whoever
+    /// set the value is the trust anchor. Never defaults — malformed or
+    /// oversized JSON fails closed.
+    ///
+    /// Gated behind the `inline-policy` cargo feature: a production build omits
+    /// this variant entirely, so it cannot read policy from the environment.
+    #[cfg(feature = "inline-policy")]
+    Inline(String),
+}
+
 pub struct ResolverConfig {
     pub max_realizations: usize,
     pub max_timeout: Duration,
@@ -86,18 +109,18 @@ impl ResolverConfig {
 /// process-local [`Resolver`] as the calling user. There is no cross-process
 /// single-flight in this mode.
 pub fn resolve_in_process(
-    policy_path: Option<&Path>,
+    source: &PolicySource,
     request: &ResolveRequest,
 ) -> Result<ResolutionSuccess, ResolutionError> {
-    resolve_in_process_at(policy_path, Path::new(DEFAULT_POLICY_PATH), request)
+    resolve_in_process_at(source, Path::new(DEFAULT_POLICY_PATH), request)
 }
 
 fn resolve_in_process_at(
-    policy_path: Option<&Path>,
+    source: &PolicySource,
     default_path: &Path,
     request: &ResolveRequest,
 ) -> Result<ResolutionSuccess, ResolutionError> {
-    let (policy, defaulted) = in_process_policy(policy_path, default_path)?;
+    let (policy, defaulted) = in_process_policy(source, default_path)?;
     let mut config = ResolverConfig::from_environment(2, 3600);
     config.policy = policy;
     config.evaluate_as_caller = true;
@@ -110,33 +133,59 @@ fn resolve_in_process_at(
 }
 
 fn in_process_policy(
-    policy_path: Option<&Path>,
+    source: &PolicySource,
     default_path: &Path,
 ) -> Result<(ResolverPolicy, bool), ResolutionError> {
-    let (path, defaultable) = match policy_path {
-        Some(path) => (path, false),
-        None => (default_path, true),
-    };
-    match load_resolver_policy(path) {
-        Ok(policy) => Ok((policy, false)),
-        Err(error) if defaultable && error.kind() == io::ErrorKind::NotFound => Ok((
-            ResolverPolicy {
-                system: std::env::var("IMAGELESS_SYSTEM")
-                    .unwrap_or_else(|_| "x86_64-linux".to_string()),
-                cache_only: true,
-                eval_allowed_uri_prefixes: Vec::new(),
-                issuers: HashMap::new(),
-            },
-            true,
-        )),
-        Err(error) => Err(ResolutionError::new(
-            ErrorCategory::PolicyDenied,
-            format!(
-                "node resolver policy {} could not be loaded: {error}",
-                path.display()
-            ),
-            false,
-        )),
+    match source {
+        // Inline policy: the daemon environment is the trust anchor, so there is
+        // no file to own. It never defaults — invalid input fails closed.
+        #[cfg(feature = "inline-policy")]
+        PolicySource::Inline(json) => {
+            if json.len() > 1024 * 1024 {
+                return Err(ResolutionError::new(
+                    ErrorCategory::PolicyDenied,
+                    "inline resolver policy (IMAGELESS_POLICY_JSON) exceeds 1 MiB".to_string(),
+                    false,
+                ));
+            }
+            let policy = parse_policy_bytes(json.as_bytes()).map_err(|error| {
+                ResolutionError::new(
+                    ErrorCategory::PolicyDenied,
+                    format!(
+                        "inline resolver policy (IMAGELESS_POLICY_JSON) could not be loaded: {error}"
+                    ),
+                    false,
+                )
+            })?;
+            Ok((policy, false))
+        }
+        PolicySource::File(policy_path) => {
+            let (path, defaultable) = match policy_path {
+                Some(path) => (path.as_path(), false),
+                None => (default_path, true),
+            };
+            match load_resolver_policy(path) {
+                Ok(policy) => Ok((policy, false)),
+                Err(error) if defaultable && error.kind() == io::ErrorKind::NotFound => Ok((
+                    ResolverPolicy {
+                        system: std::env::var("IMAGELESS_SYSTEM")
+                            .unwrap_or_else(|_| "x86_64-linux".to_string()),
+                        cache_only: true,
+                        eval_allowed_uri_prefixes: Vec::new(),
+                        issuers: HashMap::new(),
+                    },
+                    true,
+                )),
+                Err(error) => Err(ResolutionError::new(
+                    ErrorCategory::PolicyDenied,
+                    format!(
+                        "node resolver policy {} could not be loaded: {error}",
+                        path.display()
+                    ),
+                    false,
+                )),
+            }
+        }
     }
 }
 
@@ -173,13 +222,19 @@ pub fn load_resolver_policy(path: &Path) -> io::Result<ResolverPolicy> {
             "resolver policy exceeds 1 MiB",
         ));
     }
-    let policy: ResolverPolicy =
-        serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("resolver policy is invalid: {error}"),
-            )
-        })?;
+    parse_policy_bytes(&std::fs::read(path)?)
+}
+
+/// Parse and validate policy JSON regardless of where the bytes came from (a
+/// file that already passed the ownership check, or inline environment input).
+/// The trust decision belongs to the caller; this only enforces shape.
+fn parse_policy_bytes(bytes: &[u8]) -> io::Result<ResolverPolicy> {
+    let policy: ResolverPolicy = serde_json::from_slice(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("resolver policy is invalid: {error}"),
+        )
+    })?;
     release::validate_policy(&policy, effective_uid()).map_err(to_io)?;
     Ok(policy)
 }
@@ -1839,7 +1894,7 @@ rmdir "{state}/lock"
         let absent_default = dir.join("policy.json");
 
         let error = resolve_in_process_at(
-            None,
+            &PolicySource::File(None),
             &absent_default,
             &request(
                 bundle.clone(),
@@ -1856,7 +1911,7 @@ rmdir "{state}/lock"
 
         // An explicitly configured policy path must load; it never defaults.
         let explicit = resolve_in_process_at(
-            Some(&dir.join("missing-explicit.json")),
+            &PolicySource::File(Some(dir.join("missing-explicit.json"))),
             &absent_default,
             &request(
                 bundle,
@@ -1901,7 +1956,7 @@ rmdir "{state}/lock"
         std::env::set_var("FAKE_STORE", STORE);
 
         let success = resolve_in_process_at(
-            None,
+            &PolicySource::File(None),
             &policy,
             &request(
                 bundle.clone(),
@@ -1925,6 +1980,66 @@ rmdir "{state}/lock"
         assert!(arguments.contains("--print-out-paths"));
         assert!(!arguments.contains("--user"));
         assert!(arguments.contains(".imageless-source-"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "inline-policy")]
+    #[test]
+    fn inline_policy_authorizes_evaluation_without_a_file() {
+        let dir = temporary("in-process-inline");
+        let bundle = dir.join("bundle");
+        std::fs::create_dir(&bundle).unwrap();
+        let source = dir.join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("flake.nix"), "{ outputs = _: { }; }").unwrap();
+
+        let log = dir.join("eval-args");
+        let eval_nix = dir.join("fake-eval-nix");
+        crate::testutil::executable(
+            &eval_nix,
+            &format!(
+                "printf '%s\\n' \"$@\" >> {log}\nprintf '%s\\n' {STORE}",
+                log = log.display()
+            ),
+        );
+        std::env::set_var("IMAGELESS_NIX", &eval_nix);
+        std::env::set_var("IMAGELESS_NIX_STORE", fake_nix(&dir, "true"));
+        std::env::set_var("FAKE_STORE", STORE);
+
+        // The same permissive policy, handed in inline rather than through a
+        // file — no ownership check, and it authorizes exactly as the file did.
+        let inline = PolicySource::Inline(
+            r#"{"system":"x86_64-linux","cache_only":false,"eval_allowed_uri_prefixes":["path:"],"issuers":{}}"#
+                .to_string(),
+        );
+        let success = resolve_in_process_at(
+            &inline,
+            Path::new("/nonexistent/default-policy.json"),
+            &request(
+                bundle.clone(),
+                Materialize::Flake(format!("path:{}#rootfs", source.display())),
+                5000,
+            ),
+        )
+        .unwrap();
+        std::env::remove_var("IMAGELESS_NIX");
+        std::env::remove_var("IMAGELESS_NIX_STORE");
+        assert_eq!(success.resolution.rootfs, STORE);
+        assert_eq!(success.resolution.identity, "development-source");
+
+        // Malformed inline policy fails closed and never defaults.
+        let bad = resolve_in_process_at(
+            &PolicySource::Inline("{ not json".to_string()),
+            Path::new("/nonexistent/default-policy.json"),
+            &request(
+                bundle,
+                Materialize::Flake(format!("path:{}#rootfs", source.display())),
+                5000,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(bad.category, ErrorCategory::PolicyDenied);
+        assert!(bad.diagnostic.contains("IMAGELESS_POLICY_JSON"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -36,7 +36,7 @@ pub use release::{
 };
 pub use resolver::{
     handle_connection, load_resolver_policy, resolve_in_process, serve, DevelopmentWorkerConfig,
-    Resolver, ResolverConfig, DEFAULT_POLICY_PATH,
+    PolicySource, Resolver, ResolverConfig, DEFAULT_POLICY_PATH,
 };
 pub use spec::{action_of, canonical_bundle, expansion_request, plan, validate_store_path};
 
