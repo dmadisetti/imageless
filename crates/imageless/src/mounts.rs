@@ -147,6 +147,16 @@ pub(crate) fn apply_node_store_projection(
     document: &mut serde_json::Value,
     projection: &StoreProjection,
 ) -> io::Result<()> {
+    // The rootfs store path is projected AS the container root (`root.path`), so
+    // it must not also be bound as a store path inside itself: runc refuses a
+    // mount whose target coincides with the container's own rootfs ("mountpoint
+    // is on the top of rootfs"). The whole node closure legitimately contains
+    // the rootfs path; drop just that one from the per-path binds.
+    let container_root = document
+        .get("root")
+        .and_then(|root| root.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let mounts = document
         .as_object_mut()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "config.json is not an object"))?
@@ -216,6 +226,9 @@ pub(crate) fn apply_node_store_projection(
                 "type": "tmpfs"
             }));
             for path in paths {
+                if container_root.as_deref() == Some(path.as_str()) {
+                    continue;
+                }
                 mounts.push(serde_json::json!({
                     "destination": path,
                     "options": ["rbind", "ro", "nosuid", "nodev"],
@@ -329,8 +342,10 @@ printf '%s\n' "/nix/store/11111111111111111111111111111111-libc""#,
             tmpfs["options"],
             serde_json::json!(["nosuid", "nodev", "mode=0755"])
         );
-        // Exactly one read-only bind per closure path, each ordered after the
-        // tmpfs, and no whole-store bind at `/nix/store`.
+        // One read-only bind per closure path, each ordered after the tmpfs, no
+        // whole-store bind at `/nix/store`, and — crucially — the rootfs's own
+        // store path (`STORE`, projected as the container root) is NOT bound
+        // inside itself, so runc does not reject it as "on the top of rootfs".
         let store_binds: Vec<(usize, &str)> = mounts
             .iter()
             .enumerate()
@@ -344,12 +359,12 @@ printf '%s\n' "/nix/store/11111111111111111111111111111111-libc""#,
             .collect();
         assert_eq!(
             store_binds.iter().map(|(_, dst)| *dst).collect::<Vec<_>>(),
-            vec![STORE, "/nix/store/11111111111111111111111111111111-libc"]
+            vec!["/nix/store/11111111111111111111111111111111-libc"]
         );
         assert!(store_binds.iter().all(|(index, _)| *index > store_tmpfs[0]));
         assert!(store_binds
             .iter()
-            .all(|(_, destination)| *destination != NIX_STORE_PATH));
+            .all(|(_, destination)| *destination != NIX_STORE_PATH && *destination != STORE));
         for (_, destination) in &store_binds {
             let mount = mounts
                 .iter()
