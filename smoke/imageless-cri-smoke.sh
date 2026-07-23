@@ -58,18 +58,6 @@ root_for_container() {
     -maxdepth 1 -name .imageless-rootfs-gcroot -type l -print -quit 2>/dev/null || true
 }
 
-wait_exited() {
-  local id=$1
-  for _ in $(seq 1 100); do
-    if [[ $("${CRICTL[@]}" inspect "$id" | jq -r '.status.state') == CONTAINER_EXITED ]]; then
-      return
-    fi
-    sleep 0.05
-  done
-  echo "container $id did not exit" >&2
-  return 1
-}
-
 cleanup_container() {
   local id=${1:-}
   [[ -z $id ]] || "${CRICTL[@]}" stop --timeout 1 "$id" >/dev/null 2>&1 || true
@@ -138,7 +126,7 @@ SIDECAR=''
 MAIN=''
 trap 'cleanup_container "$MAIN"; cleanup_container "$SIDECAR"; cleanup_pod "$POD"; rm -rf "$WORK"' EXIT
 write_pod_config "$WORK/pod.json" imageless-lifecycle "imageless-$(date +%s%N)"
-write_container_config "$WORK/init.json" init "exit 0"
+write_container_config "$WORK/init.json" init "/bin/sleep 600"
 write_container_config "$WORK/sidecar.json" sidecar "/bin/sleep 600"
 write_container_config "$WORK/main.json" main "/bin/sleep 600"
 write_container_config "$WORK/failed.json" failed "exec /does-not-exist"
@@ -146,11 +134,18 @@ write_container_config "$WORK/failed.json" failed "exec /does-not-exist"
 # The annotated sandbox must pass without trying to resolve its rootfs.
 POD=$("${CRICTL[@]}" runp --runtime "$HANDLER" "$WORK/pod.json")
 
-# Selected init and unselected sidecar exercise both selector branches.
+# Selected init and unselected sidecar exercise both selector branches. Assert
+# the gc root on a RUNNING container: the root is planted when CRI creates the
+# task (StartContainer -> runc create), and CRI deletes the task — and its
+# bundle, with the gc root inside it — the moment a container EXITS
+# (handleContainerExit -> task.Delete). Checking after exit races that delete
+# against the CONTAINER_EXITED status update, which is why it was flaky on newer
+# containerd. A long-lived command keeps the bundle observable.
 INIT=$("${CRICTL[@]}" create --no-pull "$POD" "$WORK/init.json" "$WORK/pod.json")
 "${CRICTL[@]}" start "$INIT" >/dev/null
-wait_exited "$INIT"
-[[ -L $(root_for_container "$INIT") ]]
+INIT_ROOT=$(root_for_container "$INIT")
+[[ -L $INIT_ROOT ]]
+[[ $(readlink "$INIT_ROOT") == "$ROOTFS" ]]
 cleanup_container "$INIT"
 
 SIDECAR=$("${CRICTL[@]}" create --no-pull "$POD" "$WORK/sidecar.json" "$WORK/pod.json")
