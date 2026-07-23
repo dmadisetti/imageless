@@ -21,7 +21,11 @@
         imageless = final.callPackage ./nix/package.nix { };
       };
 
-      packages = forAllSystems (system:
+      # Full per-system set, INCLUDING the two NixOS VM acceptance gates. This
+      # is not a standard flake output name, so `nix flake check` never
+      # evaluates it — `packages` (below) drops the VM gates and `legacyPackages`
+      # re-exposes them without duplicating their definitions.
+      allPackages = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           inherit (pkgs) lib;
@@ -379,6 +383,24 @@
           default = imageless-runc;
         });
 
+      # `nix flake check` evaluates every derivation under `packages` and
+      # `checks`. A NixOS VM test's qemu closure reads the .drv it seeds via
+      # virtualisation.additionalPaths (smoke-rootfs) at EVAL time, which is not
+      # valid on a fresh store — so the two VM gates cannot live under either.
+      # They go under legacyPackages, the one derivation-bearing output flake
+      # check skips. `nix build .#imageless-cri-vm` still resolves them (the
+      # installable lookup falls through packages -> legacyPackages), and the
+      # KVM acceptance-gates CI job builds them there.
+      packages = forAllSystems (system:
+        builtins.removeAttrs self.allPackages.${system} [
+          "docker-embedded-smoke"
+          "imageless-cri-vm"
+        ]);
+
+      legacyPackages = forAllSystems (system: {
+        inherit (self.allPackages.${system}) docker-embedded-smoke imageless-cri-vm;
+      });
+
       checks = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
@@ -461,15 +483,9 @@
         in
         # Every package is a check (a package that doesn't build is a broken
         # release), plus the lint/module-eval gates only checks carry. The two
-        # NixOS VM gates are excluded: they seed a buildable .drv into the
-        # guest via virtualisation.additionalPaths, which `nix flake check`
-        # cannot evaluate on a fresh store (closureInfo needs the .drv already
-        # valid). They are built directly — as packages — by the KVM
-        # acceptance-gates CI job, which is where VM tests belong.
-        (builtins.removeAttrs self.packages.${system} [
-          "docker-embedded-smoke"
-          "imageless-cri-vm"
-        ]) // {
+        # NixOS VM gates are deliberately absent from `packages` (they live under
+        # legacyPackages — see above), so they are naturally excluded here too.
+        self.packages.${system} // {
           inherit lint module-eval;
         });
 
