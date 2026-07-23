@@ -1,0 +1,25 @@
+# A generic digest-addressed imageless workload. The CRI image is only a tiny
+# placeholder; the authorized release supplies rootfs and image-like process
+# metadata. The reference is issuer/name@sha256:<digest of the canonical
+# release manifest> as published by your CI.
+#
+# The runtime handler must pass `imageless.run/*` pod annotations.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: imageless-agent
+  annotations:
+    # Pinned at apply time by tooling (e.g. your CI's release publisher), not
+    # typed by hand; nodes only accept digest-addressed references.
+    imageless.run/release-v1: example/agent@sha256:REPLACE_DIGEST
+    imageless.run/containers-v1: agent
+spec:
+  runtimeClassName: imageless
+  restartPolicy: Never
+  containers:
+    - name: agent
+      image: localhost/imageless-placeholder:v1
+      resources:
+        limits:
+          memory: "4Gi"
+          cpu: "2"

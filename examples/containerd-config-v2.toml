@@ -1,0 +1,11 @@
+# containerd 1.x CRI config (configuration schema version 2).
+version = 2
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.imageless]
+  runtime_type = "io.containerd.runc.v2"
+  pod_annotations = ["imageless.run/*"]
+  container_annotations = ["imageless.run/*"]
+
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.imageless.options]
+    BinaryName = "/usr/local/bin/imageless-runc"
+    SystemdCgroup = true

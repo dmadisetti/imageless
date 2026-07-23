@@ -1,0 +1,23 @@
+# Generic containerd 2.x CRI runtime handler for imageless releases.
+# Merge into /etc/containerd/config.toml, then `systemctl restart containerd`.
+# See containerd-config-v2.toml for containerd 1.x.
+#
+# The stock runc shim drives the interposer: runtime_type stays
+# "io.containerd.runc.v2" and BinaryName points it at `imageless-runc`,
+# which resolves annotated bundles and delegates every verb to real runc.
+version = 3
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.imageless]
+  runtime_type = "io.containerd.runc.v2"
+
+  # Copy only the generic production contract onto the OCI spec. Add
+  # "run.imageless.*" only on nodes that explicitly enable the unprivileged
+  # development-source worker. Application runtimes may add their own separate
+  # annotation namespace without changing imageless.
+  pod_annotations = ["imageless.run/*"]
+  container_annotations = ["imageless.run/*"]
+
+  [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.imageless.options]
+    BinaryName = "/usr/local/bin/imageless-runc"
+    # runc-v2 default; container cgroups are managed by the node's cgroup driver.
+    SystemdCgroup = true

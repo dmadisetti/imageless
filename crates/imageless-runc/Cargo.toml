@@ -1,0 +1,14 @@
+[package]
+name = "imageless-runc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "runc-compatible imageless interposer for Docker and other OCI callers"
+
+[[bin]]
+name = "imageless-runc"
+path = "src/main.rs"
+
+[dependencies]
+imageless = { path = "../imageless" }

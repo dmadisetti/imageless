@@ -1,0 +1,23 @@
+[package]
+name = "imageless-resolver"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "imageless resolver daemon and unprivileged development evaluator"
+
+[[bin]]
+name = "imageless-resolver"
+path = "src/resolver.rs"
+
+[[bin]]
+name = "imageless-dev-resolver"
+path = "src/dev_resolver.rs"
+
+[dependencies]
+imageless = { path = "../imageless" }
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+oci-spec = "0.7"
