@@ -197,6 +197,24 @@ pub(crate) fn apply_node_store_projection(
             }));
         }
         StoreProjection::Closure(paths) => {
+            // The sparse rootfs's `/nix/store` is itself a read-only Nix store
+            // path, so a stock runtime cannot `mkdir` the per-path mountpoints a
+            // closure bind needs. Lay an empty writable tmpfs over `/nix/store`
+            // first (the mountpoint dir already exists in the rootfs), giving the
+            // runtime a writable surface to create each `/nix/store/<hash>`
+            // mountpoint; the real paths are then read-only binds on top. The
+            // tmpfs root is writable but empty and per-container ephemeral, and a
+            // workload write there cannot shadow a path already bound read-only —
+            // so confidentiality (only the closure is visible) and the integrity
+            // of each store path are both preserved. Ordering matters: the tmpfs
+            // must precede the binds so the runtime mounts it before creating the
+            // mountpoints inside it.
+            mounts.push(serde_json::json!({
+                "destination": NIX_STORE_PATH,
+                "options": ["nosuid", "nodev", "mode=0755"],
+                "source": "tmpfs",
+                "type": "tmpfs"
+            }));
             for path in paths {
                 mounts.push(serde_json::json!({
                     "destination": path,
@@ -296,21 +314,47 @@ printf '%s\n' "/nix/store/11111111111111111111111111111111-libc""#,
         let mounts = applied["mounts"].as_array().unwrap();
         // The original workload mount is preserved.
         assert_eq!(mounts[0]["destination"], "/data");
-        // Exactly one read-only bind per closure path and no whole-store bind.
-        let store_binds: Vec<&str> = mounts
+        // An empty writable tmpfs scaffolds `/nix/store` so the runtime can
+        // create the per-path mountpoints, and it precedes the binds.
+        let store_tmpfs: Vec<usize> = mounts
             .iter()
-            .filter_map(|mount| mount["destination"].as_str())
-            .filter(|destination| destination.starts_with(NIX_STORE_PATH))
+            .enumerate()
+            .filter(|(_, mount)| mount["destination"] == NIX_STORE_PATH && mount["type"] == "tmpfs")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(store_tmpfs.len(), 1);
+        let tmpfs = &mounts[store_tmpfs[0]];
+        assert_eq!(tmpfs["source"], "tmpfs");
+        assert_eq!(
+            tmpfs["options"],
+            serde_json::json!(["nosuid", "nodev", "mode=0755"])
+        );
+        // Exactly one read-only bind per closure path, each ordered after the
+        // tmpfs, and no whole-store bind at `/nix/store`.
+        let store_binds: Vec<(usize, &str)> = mounts
+            .iter()
+            .enumerate()
+            .filter(|(_, mount)| mount["type"] == "bind")
+            .filter_map(|(index, mount)| {
+                mount["destination"]
+                    .as_str()
+                    .filter(|destination| destination.starts_with(NIX_STORE_PATH))
+                    .map(|destination| (index, destination))
+            })
             .collect();
         assert_eq!(
-            store_binds,
+            store_binds.iter().map(|(_, dst)| *dst).collect::<Vec<_>>(),
             vec![STORE, "/nix/store/11111111111111111111111111111111-libc"]
         );
-        assert!(!store_binds.contains(&NIX_STORE_PATH));
-        for mount in mounts
+        assert!(store_binds.iter().all(|(index, _)| *index > store_tmpfs[0]));
+        assert!(store_binds
             .iter()
-            .filter(|mount| mount["destination"].as_str() != Some("/data"))
-        {
+            .all(|(_, destination)| *destination != NIX_STORE_PATH));
+        for (_, destination) in &store_binds {
+            let mount = mounts
+                .iter()
+                .find(|mount| mount["destination"].as_str() == Some(destination))
+                .unwrap();
             assert_eq!(mount["source"], mount["destination"]);
             assert_eq!(
                 mount["options"],

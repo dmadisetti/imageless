@@ -373,11 +373,14 @@
                     "and ([.mounts[]|select(.destination|startswith(\"/nix/store/\"))]|length==0)' "
                     + rewritten_bundle(node) + "/config.json"
                 )
-                # The closure backend binds only per-path closure mounts and
-                # never the whole node store.
+                # The closure backend binds only per-path closure mounts, lays a
+                # single empty tmpfs over /nix/store so those mountpoints can be
+                # created in the read-only rootfs, and never binds the whole node
+                # store.
                 closure.succeed(
                     "jq -e '([.mounts[]|select(.destination|startswith(\"/nix/store/\"))]|length>0) "
-                    "and ([.mounts[]|select(.destination==\"/nix/store\")]|length==0)' "
+                    "and ([.mounts[]|select(.destination==\"/nix/store\" and .type==\"tmpfs\")]|length==1) "
+                    "and ([.mounts[]|select(.destination==\"/nix/store\" and .type==\"bind\")]|length==0)' "
                     + rewritten_bundle(closure) + "/config.json"
                 )
 
