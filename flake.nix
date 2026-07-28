@@ -300,6 +300,11 @@
 
                 # `jq` for the projection-shape assertions in the testScript.
                 environment.systemPackages = [ imageless-cri-smoke pkgs.jq ];
+
+                # The retained witness workload (`sleep 600`, PID-ns init, so
+                # it ignores SIGTERM) would otherwise hold each reboot at the
+                # 90s default stop timeout before systemd-shutdown SIGKILLs it.
+                systemd.settings.Manager.DefaultTimeoutStopSec = "10s";
               };
             in
             {
@@ -310,6 +315,13 @@
                 services.imageless.storeProjection = "closure";
               };
               testScript = ''
+                # The driver passes qemu `-no-reboot` unless a machine is
+                # started with allow_reboot, so the deliberate in-guest reboot
+                # below would exit the VM and drop the backdoor shell. Boot
+                # explicitly before wait_for_unit lazily boots without it.
+                for machine in (node, closure):
+                    machine.start(allow_reboot=True)
+
                 for machine in (node, closure):
                     machine.wait_for_unit("imageless-resolver.service")
                     machine.wait_for_unit("containerd.service")
