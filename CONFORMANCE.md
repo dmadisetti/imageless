@@ -29,7 +29,12 @@ someone ran for its own sake. A gate run does not qualify, however realistic.
 One row per consumer x gate x matrix cell. Every VM gate prints a
 `### MATRIX` line stating the versions it actually exercised, so a linked run
 is self-describing; the rootless stock-runc smoke runs in the `build` job of
-the same workflow.
+the same workflow. Since the external-references work, the CRI gates also
+exercise SPEC §3's external mode: a pinned `tarball+http://…?narHash=…`
+reference served on guest loopback materializes, a non-allow-listed remote
+prefix is denied by the resolver, and a node-local scheme is rejected in the
+shim — gate coverage of §3, distinct from the *deployment attestation* the
+freeze criteria additionally require below.
 
 | Consumer | Gate | Matrix cell | Commit | Date | Evidence | Freeze |
 |---|---|---|---|---|---|---|

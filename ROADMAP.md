@@ -33,7 +33,7 @@ of arriving alongside the core the way they did in the incubation repo.
 
 ## v0.2 — make the base product complete
 
-- [ ] **External flake references as a first-class mode.** `run.imageless.source`
+- [x] **External flake references as a first-class mode.** `run.imageless.source`
       may name a flake ref, gated by node policy
       (`eval_allowed_uri_prefixes`). Docs recommend enabling evaluation
       (`cache_only: false`) wherever embedded flakes are the point; the shipped
