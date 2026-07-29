@@ -1,0 +1,17 @@
+[package]
+name = "kubectl-imageless"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "kubectl plugin: pack a directory into an imageless seed image and run it — zero Nix, zero Docker on the client"
+# Deployed from the flake; kubectl discovers the binary by name on PATH.
+publish = false
+
+[dependencies]
+imageless = { path = "../imageless" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"
+sha2 = "0.10"
+hex = "0.4"
