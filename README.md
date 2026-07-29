@@ -4,7 +4,7 @@
 in its layers bootstraps its own root filesystem at container-create time —
 through stock Docker, containerd, and Kubernetes.
 
-```
+```text
 seed image layer:  /etc/imageless/flake.nix  (+ lock + sources)
         │
         ▼  docker run / kubelet → containerd → runc create
@@ -45,19 +45,36 @@ nix build .#imageless-runc
 #    always want the opt-in — examples/dev-policy.json sets "cache_only": false
 sudo install -Dm600 examples/dev-policy.json /etc/imageless/policy.json
 
-# 3. Run a seed image whose only contents are a flake and its inputs
-docker run --runtime=imageless localhost/my-seed
+# 3. Build and load a real seed image. `nginx-embedded-image` is a ~2 KB
+#    image whose entire contents are examples/nginx-embedded/{flake.nix,flake.lock}
+docker load < "$(nix build .#nginx-embedded-image --print-out-paths)"
+
+# 4. Run it. nginx does not exist in the image; the node materializes it.
+docker run --rm --runtime=imageless --network=host --tmpfs /tmp \
+  localhost/imageless-nginx-embedded:e2e
+curl -s http://127.0.0.1:18080/   # => imageless-nginx-ok
 ```
+
+**How the runtime found the flake:** nothing above passes an annotation. A
+plain regular file at `etc/imageless/flake.nix` in the image's rootfs is
+auto-discovered and selects the container, with source `/etc/imageless` and the
+runtime's default output (`rootfs`, see `IMAGELESS_DEFAULT_OUTPUT`). That is
+the zero-config path — an image with no such file is passed straight through to
+stock runc, untouched. Deployer-side overrides (a different source, a different
+output, per-container selection) are annotations only; when they are present,
+discovery is skipped. See [SPEC.md](SPEC.md) for the annotation set.
 
 No daemon. The shim materializes in-process by node policy. Multi-tenant
 nodes can instead run the optional `imageless-resolver` daemon (selected via
 `IMAGELESS_RESOLVER_SOCKET`) for node-wide concurrency caps, single-flight
 coalescing of identical realizations, and privilege-separated evaluation.
 
-The end-to-end proof lives in `nix build .#checks.x86_64-linux.docker-embedded-smoke`:
-the seed's layer deliberately lacks the executable that produces the expected
-HTTP response — a successful response proves the rootfs was materialized from
-the flake, not shipped in the image.
+`dev/docker/` runs exactly this against a throwaway Docker daemon that touches
+nothing under `/etc` — the recommended way to try it on a machine you care
+about. The hermetic end-to-end proof lives in `nix build .#docker-embedded-smoke`
+(a NixOS VM test; it needs KVM): the seed's layer deliberately lacks the
+executable that produces the expected HTTP response — a successful response
+proves the rootfs was materialized from the flake, not shipped in the image.
 
 ## Kubernetes
 
@@ -97,7 +114,7 @@ imageless exists because we need a different set of guarantees:
 |---|---|---|
 | **Where the flake lives** | A flake *reference* in pod metadata; the node fetches and builds whatever the annotation points at. | **In the image layers.** The deployable artifact is self-contained and content-addressed; registries, digest pinning, admission policy, and air-gapped nodes work unchanged. Pointing at an external flake ref is *also* supported — but as a mode the node's policy must explicitly enable, not the default trust model. |
 | **Interception seam** | A containerd TTRPC shim wrapping `Task.Create` — coupled to containerd's shim interfaces and version, Kubernetes-only. | The `runc create` CLI seam (or direct library linkage in your runtime) — works for raw Docker, containerd 1.x and 2.x, and any CRI, with no TTRPC surface to track. |
-| **Trust and policy** | The node builds what workloads name; isolation/allowlisting is future work. | Node-owned policy daemon: evaluation is **off by default** (`cache_only`), staged sources are size/entry-bounded and symlink-free, evaluation (when enabled) runs in a privilege-dropped, rlimited worker, and production nodes resolve only digest-addressed releases from allow-listed issuers and caches. |
+| **Trust and policy** | The node builds what workloads name; isolation/allowlisting is future work. | Node-owned policy: evaluation is **off by default** (`cache_only`), an enabled node still evaluates only URI prefixes its policy allow-lists, staged sources are size/entry-bounded and symlink-free, and production nodes resolve only digest-addressed releases from allow-listed issuers and caches. Privilege separation is opt-in: see below. |
 | **Lifecycle correctness** | Store GC is delegated to the operator. | GC roots are tied to the container: registered at create, released on failure or delete; a live container survives `nix-collect-garbage`. Atomic spec rewrite, bounded materialization with process-tree kill, fail-closed validation. |
 | **Scope** | An experimental tool. | A spec with a reference shim, acceptance gates (Docker embedded-layer proof + CRI lifecycle VM test), and a library for embedding into other OCI runtimes. |
 
@@ -105,21 +122,89 @@ If you want "pod annotation → flake ref → container" with minimal machinery,
 containix is simpler. If the artifact of record must remain an OCI image and
 the node must decide what it will and won't build, that is imageless.
 
+## Who runs the evaluation
+
+Be precise about this, because the two deployment shapes differ:
+
+- **Daemonless (the default).** `imageless-runc` materializes in-process and
+  evaluation runs **as the calling process** — under Docker or containerd that
+  is root. There is no privilege drop, no rlimit, and no environment scrub on
+  this path. What bounds it is policy, not privilege: evaluation is off unless
+  the node's `policy.json` sets `cache_only: false`, and even then only URIs
+  matching `eval_allowed_uri_prefixes` are evaluated, under a wall-clock
+  timeout with process-tree kill. Appropriate when every workload on the node
+  is already trusted with root — a dev box, a single-tenant node.
+- **Daemon (`imageless-resolver`, opt-in via `IMAGELESS_RESOLVER_SOCKET`).**
+  The daemon refuses to enable evaluation at all without
+  `--development-worker`/`--development-worker-user`, and runs every evaluation
+  through that worker: a separate unprivileged user, CPU rlimit, and a cleared,
+  explicitly reconstructed environment. This is the posture for multi-tenant
+  nodes, and it also supplies node-wide concurrency caps and single-flight.
+
+Release-profile materialization (digest-addressed, from allow-listed issuers
+and caches) substitutes rather than evaluates and is the same on both paths.
+
 ## Embedding the library
 
 The shim is a ~200-line consumer of the `imageless` crate. A runtime that owns
 its `create` path can skip the interposer entirely:
 
 ```rust
-use imageless::{resolve_and_apply_bundle, remove_bundle_gc_roots};
+use imageless::{remove_bundle_gc_roots, resolve_and_apply_bundle, MaterializerConfig};
+use std::path::Path;
 
-// during OCI create, after the bundle is staged:
-let applied = resolve_and_apply_bundle(
-    &bundle.join("config.json"), &bundle, "rootfs", timeout_secs, &resolver_socket,
-)?; // Ok(None) => not an imageless bundle; proceed unchanged
-// on any later failure or at delete:
-remove_bundle_gc_roots(&bundle)?;
+/// Call during OCI `create`, once the bundle is staged.
+fn create(bundle: &Path) -> std::io::Result<()> {
+    // Ok(None) => not an imageless bundle; proceed unchanged.
+    let _applied = resolve_and_apply_bundle(
+        &bundle.join("config.json"),
+        bundle,
+        "rootfs", // default flake output when the image names none
+        300,      // materialization timeout, seconds
+        // Socket(path) for the daemon, InProcess(policy) for daemonless;
+        // from_environment() picks by IMAGELESS_RESOLVER_SOCKET / IMAGELESS_POLICY.
+        &MaterializerConfig::from_environment(),
+    )?;
+    Ok(())
+}
+
+/// Call on any later failure, and at `delete`.
+fn cleanup(bundle: &Path) -> std::io::Result<()> {
+    remove_bundle_gc_roots(bundle)
+}
 ```
+
+This block is compiled as a doc-test of the `imageless` crate
+(`crates/imageless/src/lib.rs`, `ReadmeDoctests`), so it cannot drift from the
+API.
+
+## Environment variables
+
+Every knob below is read at runtime by `imageless-runc` (and, where noted, the
+resolver daemon). The NixOS module sets the operator-facing ones for you; the
+list is here so a hand-rolled deployment is not guesswork.
+
+Operator-facing:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `IMAGELESS_RESOLVER_SOCKET` | unset | Non-empty selects the daemon: materialization goes over this UNIX socket instead of running in-process. Unset (or empty) is the daemonless default. |
+| `IMAGELESS_POLICY` | `/etc/imageless/policy.json` | Node policy file for in-process materialization. An explicit path *must* load or create fails closed; the default path is allowed to be absent, in which case a fail-closed `cache_only` policy is synthesized. The file must be owned by the uid the runtime runs as and not group/world writable. Ignored when a resolver socket is configured. |
+| `IMAGELESS_STORE_PROJECTION` | unset (`node`) | `closure` binds only the selected release's closure, one read-only mount per store path — the hardened backend. Any other value keeps the whole-node `/nix/store` bind. |
+| `IMAGELESS_REALIZATION_TIMEOUT_SECONDS` | `300` | Wall-clock bound on materialization, 1–3600. Out-of-range or non-integer values fail the create. |
+| `IMAGELESS_DEFAULT_OUTPUT` | `rootfs` | Flake output used when the image carries no `run.imageless.output` annotation. |
+| `IMAGELESS_TELEMETRY_PATH` | unset | Append per-phase timing events (selection, policy verification, substitution, rewrite, delegate startup) as ndjson to this file. Unset disables telemetry; write failures are ignored and never fail a create. |
+| `IMAGELESS_RUNC` | the stock `runc` baked in at build time (`runc` on PATH for an unbaked build) | The real OCI runtime to delegate to after the rewrite. Set this if you install `imageless-runc` *as* `runc`, so delegation cannot recurse through `PATH`. |
+| `IMAGELESS_NIX` / `IMAGELESS_NIX_STORE` | baked at build time (`nix` / `nix-store` on PATH for an unbaked build) | The `nix` and `nix-store` binaries the materializer drives, in-process and in the daemon. `IMAGELESS_NIX_STORE` is also used for closure enumeration under `IMAGELESS_STORE_PROJECTION=closure`. |
+| `IMAGELESS_SYSTEM` | `x86_64-linux` | Nix system double for the synthesized fail-closed default policy. A loaded policy file carries its own `system` and wins, so this only matters when no policy file exists. |
+
+Internal / development only:
+
+| Variable | Notes |
+|---|---|
+| `IMAGELESS_POLICY_JSON` | Node policy inline as JSON, ≤1 MiB, trusted because the daemon environment set it. Compiled in **only** under the `inline-policy` cargo feature (`nix build .#imageless-dev`) and absent from a production binary. Exists so the dev Docker harness can run a root daemon with no policy file to own — see `dev/docker/README.md`. Ignored when `IMAGELESS_RESOLVER_SOCKET` is set. |
+| `IMAGELESS_DEV_PATH`, `IMAGELESS_DEV_SSL_CERT_FILE` | Build-time only (`option_env!`, baked by `nix/package.nix`): the sanitized `PATH` and CA bundle handed to the privilege-dropped development evaluator, which otherwise runs with a cleared environment. Setting them at runtime does nothing. |
+| `IMAGELESS_DOCKER_*`, `IMAGELESS_SMOKE_*` | Inputs to the acceptance smoke harnesses only (`crates/imageless-runc/tests/`, `smoke/`). Not read by any shipped binary. |
 
 ## Repository layout
 

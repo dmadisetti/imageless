@@ -459,7 +459,8 @@
           inherit (pkgs) lib;
           src = lib.fileset.toSource {
             root = ./.;
-            fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./crates ];
+            # README.md is compiled as a doc-test (crates/imageless/src/lib.rs).
+            fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./crates ./README.md ];
           };
           # Workspace-wide gate: fails on any rustfmt drift or clippy warning.
           lint = pkgs.stdenv.mkDerivation {
