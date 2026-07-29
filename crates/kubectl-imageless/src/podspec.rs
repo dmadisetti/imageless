@@ -1,0 +1,181 @@
+//! Pod manifest for a seed image, validated with the node's own contract.
+//!
+//! The annotations written here are passed through `imageless::plan` before
+//! anything is printed, so a selection the node would reject is rejected at
+//! authoring time with the node's own error text.
+
+use imageless::{plan, OUTPUT_ANNOTATION, SOURCE_ANNOTATION};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// The source the node's zero-config discovery synthesizes for an embedded
+/// flake; written explicitly so the pod manifest is self-describing.
+const EMBEDDED_SOURCE: &str = "/etc/imageless";
+
+pub struct PodSpec<'a> {
+    pub name: &'a str,
+    pub namespace: Option<&'a str>,
+    /// Digest-pinned reference: `HOST/REPO@sha256:<manifest-digest>`.
+    pub image: &'a str,
+    pub runtime_class: &'a str,
+    pub output: Option<&'a str>,
+    pub command: &'a [String],
+}
+
+pub fn seed_pod(spec: &PodSpec) -> Result<Value, String> {
+    if spec.command.is_empty() {
+        return Err(
+            "a workload command is required (the materialized rootfs chooses its own layout, \
+             so there is no entrypoint to fall back on); pass it after `--`"
+                .to_string(),
+        );
+    }
+    validate_name(spec.name)?;
+    let mut annotations =
+        HashMap::from([(SOURCE_ANNOTATION.to_string(), EMBEDDED_SOURCE.to_string())]);
+    if let Some(output) = spec.output {
+        annotations.insert(OUTPUT_ANNOTATION.to_string(), output.to_string());
+    }
+    plan(&annotations, Path::new("/"), "rootfs").map_err(|error| error.to_string())?;
+
+    let mut metadata = json!({
+        "name": spec.name,
+        "labels": { "app.kubernetes.io/managed-by": "kubectl-imageless" },
+        "annotations": annotations,
+    });
+    if let Some(namespace) = spec.namespace {
+        metadata["namespace"] = json!(namespace);
+    }
+    Ok(json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": metadata,
+        "spec": {
+            "runtimeClassName": spec.runtime_class,
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": "workload",
+                "image": spec.image,
+                "imagePullPolicy": "IfNotPresent",
+                "command": spec.command,
+            }],
+        },
+    }))
+}
+
+/// RFC 1123 label: what the API server enforces for pod names.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name}: pod names are lowercase alphanumerics and `-`, at most 63 characters"
+        ))
+    }
+}
+
+/// Derive a pod name from a directory name, or fall back to `imageless-run`.
+pub fn derive_name(directory: &Path) -> String {
+    // Canonicalize so `run .` names the pod after the actual directory —
+    // `Path::new(".").file_name()` is `None`, not the current directory.
+    let canonical = directory.canonicalize();
+    let directory = canonical.as_deref().unwrap_or(directory);
+    let raw = directory
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mut name = String::new();
+    for character in raw.chars() {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            name.push(character);
+        } else if !name.is_empty() && !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    let name = name.trim_matches('-');
+    let name = &name[..name.len().min(63)];
+    if name.is_empty() {
+        "imageless-run".to_string()
+    } else {
+        name.trim_matches('-').to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec<'a>(command: &'a [String]) -> PodSpec<'a> {
+        PodSpec {
+            name: "demo",
+            namespace: None,
+            image: "registry.example/apps/demo@sha256:0000",
+            runtime_class: "imageless",
+            output: None,
+            command,
+        }
+    }
+
+    #[test]
+    fn the_manifest_selects_the_embedded_source() {
+        let command = vec!["/bin/server".to_string(), "--port=8080".to_string()];
+        let pod = seed_pod(&spec(&command)).unwrap();
+        assert_eq!(
+            pod["metadata"]["annotations"][SOURCE_ANNOTATION],
+            EMBEDDED_SOURCE
+        );
+        assert_eq!(pod["spec"]["runtimeClassName"], "imageless");
+        assert_eq!(pod["spec"]["restartPolicy"], "Never");
+        assert_eq!(pod["spec"]["containers"][0]["command"][1], "--port=8080");
+        assert!(pod["metadata"]["annotations"][OUTPUT_ANNOTATION].is_null());
+    }
+
+    #[test]
+    fn a_missing_command_fails_at_authoring_time() {
+        let error = seed_pod(&spec(&[])).unwrap_err();
+        assert!(error.contains("command is required"), "{error}");
+    }
+
+    #[test]
+    fn an_invalid_output_fails_with_the_node_s_error_text() {
+        let command = vec!["/bin/true".to_string()];
+        let mut pod = spec(&command);
+        pod.output = Some("has whitespace here");
+        let error = seed_pod(&pod).unwrap_err();
+        assert!(error.contains(OUTPUT_ANNOTATION), "{error}");
+    }
+
+    #[test]
+    fn namespace_appears_only_when_given() {
+        let command = vec!["/bin/true".to_string()];
+        let mut with = spec(&command);
+        with.namespace = Some("staging");
+        assert_eq!(seed_pod(&with).unwrap()["metadata"]["namespace"], "staging");
+        assert!(seed_pod(&spec(&command)).unwrap()["metadata"]["namespace"].is_null());
+    }
+
+    #[test]
+    fn names_are_derived_and_validated() {
+        assert_eq!(derive_name(Path::new("/work/My App_v2")), "my-app-v2");
+        assert_eq!(derive_name(Path::new("/work/---")), "imageless-run");
+        assert!(validate_name("ok-name").is_ok());
+        assert!(validate_name("-leading").is_err());
+        assert!(validate_name("UPPER").is_err());
+        assert!(validate_name(&"x".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn dot_derives_from_the_actual_directory_not_the_fallback() {
+        let current = std::env::current_dir().unwrap();
+        assert_eq!(derive_name(Path::new(".")), derive_name(&current));
+        assert_ne!(derive_name(Path::new(".")), "imageless-run");
+    }
+}
