@@ -4,26 +4,26 @@ The product is the shim and the spec. Everything below is staged so that
 platform features have to *earn* their way in against a measured need, instead
 of arriving alongside the core the way they did in the incubation repo.
 
-## v0.1 — the extraction (in progress)
+## v0.1 — the extraction (complete)
 
-- [ ] Standalone workspace: own `Cargo.toml`/`Cargo.lock`, own flake +
+- [x] Standalone workspace: own `Cargo.toml`/`Cargo.lock`, own flake +
       complete `flake.lock`, CI where **every** package is in `checks` and
       lint gates merge.
-- [ ] Namespace cutover to the owned domain: `imageless.run/*` and
+- [x] Namespace cutover to the owned domain: `imageless.run/*` and
       `run.imageless.*`. Greenfield — no legacy names, no compat carve-outs;
       the code reads as if the incubation identifiers never existed.
-- [ ] Zero-config embedded discovery: `etc/imageless/flake.nix` alone selects
+- [x] Zero-config embedded discovery: `etc/imageless/flake.nix` alone selects
       a container; `source.json` is retired (the flake is the metadata —
       alias nonstandard outputs to `#rootfs` in the flake itself).
-- [ ] Deleted, not migrated: the containerd start/delete interposer (invalid
+- [x] Deleted, not migrated: the containerd start/delete interposer (invalid
       under containerd 2.x pod-shim grouping), `imagelessctl`, the release
       publisher and `publish.json`.
-- [ ] Acceptance gates as the only gates: the raw-Docker embedded-layer smoke
+- [x] Acceptance gates as the only gates: the raw-Docker embedded-layer smoke
       and the CRI lifecycle VM test, the latter extended to prove
       embedded-layer bootstrap (flake present only in the image layer).
-- [ ] Cowboy consumes this repo as a flake input; `cowboy-runtime` stays the
+- [x] Cowboy consumes this repo as a flake input; `cowboy-runtime` stays the
       first embedded-library consumer.
-- [ ] **In-process materializer — no mandatory daemon.** A `Materializer`
+- [x] **In-process materializer — no mandatory daemon.** A `Materializer`
       seam with a direct backend: the shim and library consumers read node
       policy (`/etc/imageless/policy.json` or `IMAGELESS_POLICY`) and perform
       the Nix work in-process. `imageless-resolver` becomes purely the optional
