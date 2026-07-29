@@ -52,7 +52,9 @@ Note: materializing an embedded flake is node-side evaluation, which the
 reference materializer ships **disabled** (`cache_only: true`, §6). Deployment
 documentation and examples should show the opt-in (`cache_only: false`) —
 enabling it is the expected configuration wherever embedded flakes are the
-point — but the fail-closed default is deliberate and stays.
+point — but the fail-closed default is deliberate and stays. The same opt-in
+gates external flake references (§3): they are evaluation too, plus a prefix
+allow-list of their own.
 
 ### 2.2 The flake is the metadata
 
@@ -103,6 +105,26 @@ the runtime's own rewrite of staged in-image sources, never an
 annotation-supplied path. Pin external references (locked inputs, explicit
 revisions) for anything beyond development — a mutable ref is not a deployment
 identity.
+
+Every `source` resolution — the staged in-image form and the external form
+alike — is node-side evaluation: a `cache_only` node refuses it
+(`EvaluationDisabled`) before the prefix allow-list is consulted, so the
+external mode requires **both** `cache_only: false` and a matching prefix.
+Prefix matching is a literal byte-prefix comparison against the reference (its
+output fragment removed), performed before any canonicalization or registry
+resolution. Author prefixes to a boundary: `github:myorg/` — an unterminated
+`github:myorg` also authorizes `github:myorg-evil/anything`.
+
+What counts as a pin: an explicit revision (`?rev=`, or the
+commit-addressed `github:owner/repo/<rev>` form) or a content hash
+(`?narHash=`). The referenced flake's own lock file is honored as written for
+its locked inputs; inputs it left unlocked resolve at evaluation time —
+pinning the top-level reference does not pin them. The node deliberately does
+not police pin forms: rejecting mutable references is authoring- and
+admission-tooling's job, the node contract stays the prefix allow-list, and a
+*production* identity remains a release digest (§6). External fetches are
+bounded only by the materialization deadline (§4) — the §2.3 staging bounds
+apply to in-image sources alone.
 
 Release namespace (cache-only production, §6):
 
