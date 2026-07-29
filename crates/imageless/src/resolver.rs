@@ -651,7 +651,7 @@ impl Resolver {
                 }
                 _ => ResolutionError::new(
                     ErrorCategory::Materialization,
-                    "the development resolver could not evaluate the source",
+                    format!("the development resolver could not evaluate the source: {error}"),
                     true,
                 ),
             })?
@@ -1418,10 +1418,16 @@ pub fn handle_connection(
             timings: success.timings,
             closure: closure.map(Box::new),
         },
-        Err(error) => ResolveResponse::Error {
-            version: PROTOCOL_VERSION,
-            error,
-        },
+        Err(error) => {
+            // The requesting runtime relays this diagnostic to a stderr the
+            // engine may discard (containerd keeps no create-time stderr);
+            // the daemon journal is the durable copy.
+            eprintln!("imageless-resolver: resolution failed: {error}");
+            ResolveResponse::Error {
+                version: PROTOCOL_VERSION,
+                error,
+            }
+        }
     };
     write_frame(&mut stream, &response)
 }

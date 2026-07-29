@@ -122,8 +122,17 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Resul
         return Err(io::Error::other("Nix stdout exceeded the capture limit"));
     }
     if !status.success() {
-        let _ = stderr;
-        return Err(io::Error::other("Nix operation failed"));
+        // The tail is where Nix puts the actual error; without it a failed
+        // evaluation is undiagnosable (the engine may discard the runtime's
+        // stderr entirely — containerd keeps nothing from a failed create).
+        let tail = stderr.bytes.len().saturating_sub(4096);
+        let excerpt = String::from_utf8_lossy(&stderr.bytes[tail..]);
+        let excerpt = excerpt.trim();
+        return Err(io::Error::other(if excerpt.is_empty() {
+            "Nix operation failed".to_string()
+        } else {
+            format!("Nix operation failed: {excerpt}")
+        }));
     }
     Ok(String::from_utf8_lossy(&stdout.bytes).into_owned())
 }
