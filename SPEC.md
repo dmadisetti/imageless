@@ -94,9 +94,15 @@ Development / source-evaluation namespace:
 A `source` that is not an absolute in-image path is an **external flake
 reference**. External references are a supported mode, but the node must opt in
 through materializer policy (`eval_allowed_uri_prefixes`); a node that has not
-allow-listed the reference's prefix fails the request. Pin external references
-(locked inputs, explicit revisions) for anything beyond development — a mutable
-ref is not a deployment identity.
+allow-listed the reference's prefix fails the request. External references must
+carry an explicit remote scheme: node-local schemes (`path:`, `file:`, and any
+`*+file:` transport) and registry names (bare words, `flake:`) are rejected
+before policy is consulted. The in-image `/` form is the only way an annotation
+names node-local content — the `path:` prefix a policy allow-lists authorizes
+the runtime's own rewrite of staged in-image sources, never an
+annotation-supplied path. Pin external references (locked inputs, explicit
+revisions) for anything beyond development — a mutable ref is not a deployment
+identity.
 
 Release namespace (cache-only production, §6):
 

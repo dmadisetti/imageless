@@ -234,6 +234,36 @@ pub(crate) fn validate_source(source: &str) -> Result<(), ContractError> {
                 "in-image paths must be canonical and must not contain `.` or `..` components",
             ));
         }
+        return Ok(());
+    }
+    // Anything else is an external flake reference (SPEC §3). The only way a
+    // pod may name node-local content is the in-image `/` form above: the
+    // `path:` prefix that embedded-flake policies allow-list belongs to the
+    // runtime's own rewrite of staged in-image sources, so a node-local scheme
+    // arriving through an annotation would read arbitrary node files into the
+    // staging copy. Bare registry words (and their `flake:` spelling) are
+    // rejected with the same rule — node-side registry state is not a
+    // deployment identity.
+    let scheme = match source.split_once(':') {
+        Some((scheme, _)) if !scheme.contains('/') => scheme.to_ascii_lowercase(),
+        _ => {
+            return Err(ContractError::new(
+                SOURCE_ANNOTATION,
+                "external references must carry an explicit scheme; registry names are not resolved",
+            ));
+        }
+    };
+    if scheme == "flake" {
+        return Err(ContractError::new(
+            SOURCE_ANNOTATION,
+            "external references must carry an explicit scheme; registry names are not resolved",
+        ));
+    }
+    if scheme == "path" || scheme.split('+').next_back() == Some("file") {
+        return Err(ContractError::new(
+            SOURCE_ANNOTATION,
+            "node-local schemes are not allowed in annotations; use an absolute in-image path",
+        ));
     }
     Ok(())
 }
@@ -352,6 +382,49 @@ mod tests {
             "rootfs",
         )
         .is_err());
+    }
+
+    #[test]
+    fn external_references_require_remote_schemes() {
+        for source in [
+            "github:example/agent?rev=0123456789abcdef0123456789abcdef01234567",
+            "git+https://example.com/agent.git?rev=0123456789abcdef0123456789abcdef01234567",
+            "https://example.com/agent.tar.gz",
+        ] {
+            assert_eq!(
+                plan(
+                    &annotations(&[(SOURCE_ANNOTATION, source)]),
+                    Path::new("/bundle/rootfs"),
+                    "rootfs",
+                )
+                .unwrap(),
+                Some(Materialize::Flake(format!("{source}#rootfs"))),
+                "expected {source} to pass through as an external reference"
+            );
+        }
+        // Node-local schemes would read node files through the staging copy;
+        // registry names would resolve against node-side registry state.
+        for source in [
+            "path:/etc/imageless",
+            "PATH:/etc/imageless",
+            "file:///etc/passwd",
+            "git+file:///var/lib/secrets",
+            "tarball+file:///root/archive.tar",
+            "nixpkgs",
+            "flake:nixpkgs",
+            "./agent",
+            "etc/imageless:agent",
+        ] {
+            assert!(
+                plan(
+                    &annotations(&[(SOURCE_ANNOTATION, source)]),
+                    Path::new("/bundle/rootfs"),
+                    "rootfs",
+                )
+                .is_err(),
+                "expected {source} to be rejected"
+            );
+        }
     }
 
     #[test]
