@@ -1,8 +1,15 @@
-# imageless
+<p align="center">
+  <img src="assets/imageless-logo.svg" width="150"
+       alt="The imageless logo: a Polaroid photo dissolving into an empty dashed wireframe">
+</p>
 
-**Ship the flake, not the filesystem.** An OCI image that carries a Nix flake
-in its layers bootstraps its own root filesystem at container-create time —
-through stock Docker, containerd, and Kubernetes.
+<h1 align="center">imageless</h1>
+
+<p align="center"><b>Ship the flake, not the filesystem.</b></p>
+
+<p align="center">An OCI image that carries a Nix flake in its layers bootstraps its own root
+filesystem at container-create time — through stock Docker, containerd, and
+Kubernetes.</p>
 
 ```text
 seed image layer:  /etc/imageless/flake.nix  (+ lock + sources)
@@ -16,9 +23,9 @@ stock runc starts the realized rootfs
 ```
 
 The image you push is an ordinary OCI image — registries, digests, admission
-control, `docker run`, air-gapped mirrors all keep working. It just doesn't
-contain the filesystem it will run. It contains the *recipe*, and the node's
-Nix store (or binary cache) supplies the result.
+control, `docker run`, air-gapped mirrors all keep working. Like the Polaroid
+above, it just doesn't contain the picture: it contains the *recipe*, and the
+node's Nix store (or binary cache) develops the result.
 
 imageless is two things, in this order:
 
@@ -102,6 +109,26 @@ on a real containerd/CRI node.
 
 See `examples/` for the RuntimeClass, pod, and containerd configs, and the
 NixOS module (`nixosModules.imageless`) for a packaged node setup.
+
+### The kubectl plugin
+
+`kubectl-imageless` gets a directory with a `flake.nix` onto a prepared
+cluster with **zero Nix on the client** — the packing is a plain deterministic
+tar and the evaluation happens on the node, under node policy:
+
+```bash
+nix build .#kubectl-imageless   # `kubectl imageless …` once result/bin is on PATH
+
+kubectl imageless run ./app --repo registry.example/team/app --dry-run \
+  -- /bin/server --port=8080
+```
+
+This packs `./app` into a seed OCI image under the same staging bounds the
+node enforces (so a refusal happens at authoring time, with the offending path
+in hand), prints the layer/config/manifest digests on stderr, and writes a
+digest-pinned pod manifest on stdout, ready for `kubectl apply -f -`. Pushing
+to a registry from the plugin is the next slice; today's flow is `--dry-run`
+plus your registry tooling of choice.
 
 ## Why not containix?
 
@@ -254,6 +281,8 @@ Internal / development only:
   materializer daemon and its privilege-dropped evaluation worker, for
   multi-tenant nodes that want central concurrency caps, single-flight, and
   evaluation in a separate privilege domain.
+- `crates/kubectl-imageless` — the kubectl plugin: deterministic seed packing
+  and pod authoring with zero client-side Nix.
 - `SPEC.md` — the contract.
 - `examples/`, `smoke/` — deployment examples and the acceptance smokes.
 
@@ -269,3 +298,9 @@ Internal / development only:
 - Extracted from and battle-tested inside
   [Cowboy](https://github.com/dmadisetti/cowboy); now developed standalone at
   [imageless.run](https://imageless.run).
+
+---
+
+<sub>The logo's landscape is derived from
+<a href="https://github.com/googlefonts/noto-emoji">Google Noto Emoji</a>
+(U+1F3DE, Apache-2.0).</sub>
