@@ -50,11 +50,15 @@
           binView = name: pkgs.runCommand name
             { meta.mainProgram = name; }
             ''
+              # A dirty-tree build that omitted the binary (e.g. an untracked
+              # crate) must fail here, not ship a dangling symlink.
+              test -x ${imageless}/bin/${name}
               mkdir -p $out/bin
               ln -s ${imageless}/bin/${name} $out/bin/${name}
             '';
           imageless-runc = binView "imageless-runc";
           imageless-resolver = binView "imageless-resolver";
+          kubectl-imageless = binView "kubectl-imageless";
 
           # -- Docker embedded-layer acceptance gate (SPEC.md §7.1) ---------
           # The seed carries ONLY the flake and its inputs: no metadata file,
@@ -589,7 +593,7 @@
           };
         in
         {
-          inherit imageless imageless-dev imageless-runc imageless-resolver;
+          inherit imageless imageless-dev imageless-runc imageless-resolver kubectl-imageless;
           inherit docker-embedded-seed docker-embedded-image docker-passthrough-image placeholder-image;
           inherit nginx-embedded-seed nginx-embedded-image;
           inherit docker-embedded-scenario;
