@@ -209,7 +209,13 @@ pub fn validate_store_path(field: &'static str, value: &str) -> Result<(), Contr
     Ok(())
 }
 
-pub(crate) fn validate_source(source: &str) -> Result<(), ContractError> {
+/// Validate a `run.imageless.source` annotation value (SPEC §3): an absolute,
+/// canonical in-image path, or an external flake reference carrying an
+/// explicit remote scheme — node-local schemes (`path:`, `file:`, any
+/// `*+file:` transport) and registry names (bare words, `flake:`) are
+/// rejected. Public so client-side tooling rejects exactly what the node
+/// rejects, with the node's own error text.
+pub fn validate_source(source: &str) -> Result<(), ContractError> {
     validate_scalar(SOURCE_ANNOTATION, source, MAX_ANNOTATION_VALUE_BYTES)?;
     if source.chars().any(char::is_whitespace) {
         return Err(ContractError::new(
