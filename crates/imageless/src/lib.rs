@@ -19,7 +19,7 @@ pub use bundle::{
     AppliedResolution, BundleTimings, MaterializerConfig,
 };
 pub use client::{
-    effective_uid, peer_allowed, peer_uid, read_frame, request_inspection, request_resolution,
+    effective_uid, peer_allowed, peer_uid, read_frame, request_inspection,
     request_resolution_detailed, write_frame,
 };
 pub use gc::{remove_bundle_gc_roots, remove_gc_root};
@@ -38,7 +38,14 @@ pub use resolver::{
     handle_connection, load_resolver_policy, resolve_in_process, serve, DevelopmentWorkerConfig,
     PolicySource, Resolver, ResolverConfig, DEFAULT_POLICY_PATH,
 };
-pub use spec::{action_of, canonical_bundle, expansion_request, plan, validate_store_path};
+pub use spec::{expansion_request, plan, validate_store_path};
+
+/// Compiles every Rust block in the repository README as a doc-test, so the
+/// embedding example in the front door cannot drift from this API. Not part of
+/// the crate's rendered documentation — it exists only under `cfg(doctest)`.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+pub struct ReadmeDoctests;
 
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024;
