@@ -469,6 +469,20 @@ impl Resolver {
                 .rsplit_once('#')
                 .map(|(uri, _)| uri)
                 .unwrap_or("");
+            // SPEC §3's scheme rules, re-applied at the daemon boundary: the
+            // annotation planner already rejects node-local schemes and
+            // registry names client-side, but a direct socket peer builds its
+            // own requests. The lowercase `path:` rewrite the runtime produces
+            // for staged in-image sources is the one node-local form admitted
+            // here — and it still has to pass the prefix allow-list below.
+            if !uri.starts_with("path:") && !uri_carries_remote_scheme(uri) {
+                return Err(ResolutionError::new(
+                    ErrorCategory::InvalidRequest,
+                    "external source URIs must carry an explicit remote scheme; \
+                     node-local schemes and registry names are rejected",
+                    false,
+                ));
+            }
             if !self
                 .inner
                 .config
@@ -574,8 +588,7 @@ impl Resolver {
         Ok(ResolvedRelease {
             identity: match materialize {
                 Materialize::Closure(_) => "legacy-closure".to_string(),
-                Materialize::Flake(_) => "development-source".to_string(),
-                Materialize::Release(_) => unreachable!(),
+                Materialize::Flake(_) | Materialize::Release(_) => unreachable!(),
             },
             rootfs: store_path.clone(),
             process: None,
@@ -674,7 +687,7 @@ impl Resolver {
         })?;
         self.register_root(&store_path, &root, deadline)?;
         Ok(ResolvedRelease {
-            identity: "development-source".to_string(),
+            identity: development_identity(installable),
             rootfs: store_path,
             process: None,
             mounts: Vec::new(),
@@ -1124,6 +1137,33 @@ fn wait_for_flight(flight: &Flight, deadline: Instant) -> Result<ResolvedRelease
             ));
         }
     }
+}
+
+/// Resolution identity for telemetry and journals: the runtime's own `path:`
+/// rewrite of a staged in-image source reports `development-source`; anything
+/// else was an external flake reference (SPEC §3), and operators reading
+/// timings should be able to tell the two apart.
+fn development_identity(installable: &str) -> String {
+    if installable.starts_with("path:") {
+        "development-source".to_string()
+    } else {
+        "external-source".to_string()
+    }
+}
+
+/// SPEC §3: an external reference must name a remote transport explicitly.
+/// `file:`-family schemes read node files, and registry forms (`flake:`, bare
+/// words, or a `path`/`PATH` spelling that is not the runtime's own lowercase
+/// staging rewrite) would resolve through node-side state an annotation has no
+/// business reaching.
+fn uri_carries_remote_scheme(uri: &str) -> bool {
+    let scheme = match uri.split_once(':') {
+        Some((scheme, _)) if !scheme.is_empty() && !scheme.contains('/') => {
+            scheme.to_ascii_lowercase()
+        }
+        _ => return false,
+    };
+    scheme != "flake" && scheme != "path" && scheme.split('+').next_back() != Some("file")
 }
 
 fn validate_installable(installable: &str) -> Result<(), ResolutionError> {
@@ -2126,6 +2166,132 @@ rmdir "{state}/lock"
         .unwrap_err();
         assert_eq!(bad.category, ErrorCategory::PolicyDenied);
         assert!(bad.diagnostic.contains("IMAGELESS_POLICY_JSON"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn evaluation_resolver(prefixes: &[&str], tools: Option<(&Path, &Path)>) -> Resolver {
+        let mut config = ResolverConfig::from_environment(2, 3600);
+        config.policy = ResolverPolicy {
+            system: "x86_64-linux".to_string(),
+            cache_only: false,
+            eval_allowed_uri_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            issuers: HashMap::new(),
+        };
+        config.evaluate_as_caller = true;
+        if let Some((nix, nix_store)) = tools {
+            config.nix = nix.to_path_buf();
+            config.nix_store = nix_store.to_path_buf();
+        }
+        Resolver::new(config)
+    }
+
+    #[test]
+    fn external_references_are_denied_without_an_allow_listed_prefix() {
+        let dir = temporary("external-prefix-denied");
+        let bundle = dir.join("bundle");
+        std::fs::create_dir(&bundle).unwrap();
+
+        // An embedded-flake policy (`path:` only) must not authorize an
+        // external reference, and the denial happens before any Nix work.
+        let denied = evaluation_resolver(&["path:"], None)
+            .resolve_detailed(request(
+                bundle.clone(),
+                Materialize::Flake("github:acme/app?rev=0123456#rootfs".to_string()),
+                1000,
+            ))
+            .unwrap_err();
+        assert_eq!(denied.category, ErrorCategory::PolicyDenied);
+        assert!(denied.diagnostic.contains("not authorized by node policy"));
+
+        // An empty allow-list denies every source, staged rewrites included.
+        let empty = evaluation_resolver(&[], None)
+            .resolve_detailed(request(
+                bundle.clone(),
+                Materialize::Flake("path:/staged/source#rootfs".to_string()),
+                1000,
+            ))
+            .unwrap_err();
+        assert_eq!(empty.category, ErrorCategory::PolicyDenied);
+        assert!(!bundle.join(GC_ROOT_NAME).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_rejects_node_local_schemes_regardless_of_policy() {
+        let dir = temporary("external-scheme-rejected");
+        let bundle = dir.join("bundle");
+        std::fs::create_dir(&bundle).unwrap();
+
+        // Even a policy that allow-lists these prefixes cannot launder them:
+        // the scheme rules hold at the daemon boundary, before the allow-list
+        // is consulted (SPEC §3 — rejected before policy).
+        for (prefixes, installable) in [
+            (["file://"].as_slice(), "file:///etc#rootfs"),
+            (&["git+file://"], "git+file:///srv/repo#rootfs"),
+            (&["flake:"], "flake:nixpkgs#rootfs"),
+            (&["nixpkgs"], "nixpkgs#rootfs"),
+            // The staging rewrite is lowercase `path:`; a case-mangled
+            // spelling is not the runtime's rewrite and stays node-local.
+            (&["PATH:"], "PATH:/etc#rootfs"),
+        ] {
+            let error = evaluation_resolver(prefixes, None)
+                .resolve_detailed(request(
+                    bundle.clone(),
+                    Materialize::Flake(installable.to_string()),
+                    1000,
+                ))
+                .unwrap_err();
+            assert_eq!(
+                error.category,
+                ErrorCategory::InvalidRequest,
+                "{installable} must be rejected as node-local"
+            );
+            assert!(error.diagnostic.contains("remote scheme"));
+        }
+        assert!(!bundle.join(GC_ROOT_NAME).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn external_references_evaluate_unstaged_with_their_own_identity() {
+        let dir = temporary("external-accepted");
+        let bundle = dir.join("bundle");
+        std::fs::create_dir(&bundle).unwrap();
+
+        let log = dir.join("eval-args");
+        let eval_nix = dir.join("fake-eval-nix");
+        crate::testutil::executable(
+            &eval_nix,
+            &format!(
+                "printf '%s\\n' \"$@\" >> {log}\nprintf '%s\\n' {STORE}",
+                log = log.display()
+            ),
+        );
+
+        let installable = "git+https://git.example/app?rev=0123456789abcdef#rootfs";
+        std::env::set_var("FAKE_STORE", STORE);
+        let store_nix = fake_nix(&dir, "true");
+        let success =
+            evaluation_resolver(&["git+https://git.example/"], Some((&eval_nix, &store_nix)))
+                .resolve_detailed(request(
+                    bundle.clone(),
+                    Materialize::Flake(installable.to_string()),
+                    5000,
+                ))
+                .unwrap();
+
+        // External references are evaluated verbatim — staging is for the
+        // in-image `path:` rewrite only — and report a distinct identity so
+        // telemetry can tell the two evaluation modes apart.
+        assert_eq!(success.resolution.rootfs, STORE);
+        assert_eq!(success.resolution.identity, "external-source");
+        let arguments = std::fs::read_to_string(&log).unwrap();
+        assert!(arguments.contains(installable));
+        assert!(!arguments.contains(".imageless-source-"));
+        assert_eq!(
+            std::fs::read_link(bundle.join(GC_ROOT_NAME)).unwrap(),
+            Path::new(STORE)
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
