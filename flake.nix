@@ -235,8 +235,8 @@
               export IMAGELESS_SMOKE_IMAGE_ARCHIVE=${smoke-image}
               # A bare path string, context discarded on purpose: this only
               # names the .drv the smoke realizes in-guest. The .drv (and its
-              # input closure) is seeded into the guest store by the VM test's
-              # virtualisation.additionalPaths; carrying context here would make
+              # input closure) is seeded and GC-rooted in the guest store by
+              # the VM test's system.extraDependencies; carrying context here would make
               # imageless-cri-smoke depend on the .drv and drag it into
               # `nix flake check` eval, which cannot instantiate it on a fresh
               # store.
@@ -279,23 +279,34 @@
                   "localhost/imageless-smoke:phase0";
 
                 # The smoke realises and GCs the disposable rootfs INSIDE the
-                # guest and asserts GC reclaims it after reboot. That only
-                # holds if the rootfs is built in-guest into the writable
-                # layer — so seed its derivation and build inputs, never its
-                # output.
+                # guest and asserts GC reclaims it after reboot. Two things
+                # keep that honest:
+                #
+                #  * The rebuild inputs — the .drv closure and every
+                #    build-time output (inputDerivation) — are rooted through
+                #    the SYSTEM closure. `virtualisation.additionalPaths` only
+                #    registers paths in the guest Nix database without rooting
+                #    them, and the smoke runs `nix-store --gc` itself (post-
+                #    reboot it does so BEFORE re-realising the rootfs), so
+                #    anything unrooted is collected and the rebuild degrades
+                #    into an offline world-rebuild that dies on the first
+                #    fetch. Only the rootfs OUTPUT stays unrooted: that is the
+                #    disposable path whose collection the gate asserts.
+                #
+                #  * The writable store lives on the VM disk, not the default
+                #    tmpfs upper layer. On tmpfs the pre-reboot rootfs would
+                #    vanish with the reboot itself and the "GC reclaims it
+                #    after reboot" assertion would pass vacuously.
+                system.extraDependencies = [
+                  smoke-rootfs.drvPath
+                  smoke-rootfs.inputDerivation
+                ];
                 virtualisation = {
                   writableStore = true;
+                  writableStoreUseTmpfs = false;
                   memorySize = 4096;
                   cores = 2;
                   diskSize = 8192;
-                  additionalPaths = [
-                    smoke-image
-                    imageless-cri-smoke
-                    smoke-rootfs.drvPath
-                    pkgs.bash
-                    pkgs.coreutils
-                    pkgs.stdenvNoCC
-                  ];
                 };
 
                 # `jq` for the projection-shape assertions in the testScript.
