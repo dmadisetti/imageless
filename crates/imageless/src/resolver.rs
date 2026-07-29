@@ -555,7 +555,7 @@ impl Resolver {
                 io::ErrorKind::TimedOut => ResolutionError::timeout("during materialization"),
                 _ => ResolutionError::new(
                     ErrorCategory::Materialization,
-                    "Nix could not materialize the requested rootfs",
+                    format!("Nix could not materialize the requested rootfs: {error}"),
                     true,
                 ),
             })?;
@@ -843,7 +843,7 @@ impl Resolver {
             }
             _ => ResolutionError::new(
                 ErrorCategory::CacheQuery,
-                "the authorized cache could not describe the release closure",
+                format!("the authorized cache could not describe the release closure: {error}"),
                 true,
             ),
         })?;
@@ -890,7 +890,7 @@ impl Resolver {
             io::ErrorKind::TimedOut => ResolutionError::timeout("while checking the node store"),
             _ => ResolutionError::new(
                 ErrorCategory::CacheQuery,
-                "the node store could not report valid closure paths",
+                format!("the node store could not report valid closure paths: {error}"),
                 true,
             ),
         })?;
@@ -994,7 +994,7 @@ impl Resolver {
             io::ErrorKind::TimedOut => ResolutionError::timeout("during release materialization"),
             _ => ResolutionError::new(
                 ErrorCategory::Materialization,
-                "Nix could not materialize a release store path",
+                format!("Nix could not materialize a release store path: {error}"),
                 true,
             ),
         })?;
@@ -1040,7 +1040,7 @@ impl Resolver {
             io::ErrorKind::TimedOut => ResolutionError::timeout("during GC-root registration"),
             _ => ResolutionError::new(
                 ErrorCategory::RootRegistration,
-                "Nix could not register the bundle GC root",
+                format!("Nix could not register the bundle GC root: {error}"),
                 true,
             ),
         })?;
