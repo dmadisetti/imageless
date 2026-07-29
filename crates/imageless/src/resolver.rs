@@ -609,11 +609,16 @@ impl Resolver {
             .unwrap_or(installable);
         let timeout = remaining(deadline, "before development source evaluation")?;
         let timeout_seconds = timeout.as_secs().max(1).to_string();
+        // Guard slot, not dead code: the worker's cache directory must survive
+        // until `run_command` returns, and the command is built inside the
+        // block below.
+        let mut _worker_cache = None;
         let stdout = {
             let _permit =
                 self.acquire_permit(deadline, "while waiting for a development Nix operation")?;
             let mut command = match worker {
                 Some(worker) => {
+                    let cache = create_worker_cache_directory(&worker.user)?;
                     let mut command = Command::new(&worker.program);
                     command
                         .arg("--user")
@@ -622,9 +627,12 @@ impl Resolver {
                         .arg(&self.inner.config.nix)
                         .arg("--cpu-seconds")
                         .arg(timeout_seconds)
+                        .arg("--cache-home")
+                        .arg(&cache.directory)
                         .arg("--installable")
                         .arg(evaluation_installable)
                         .env_clear();
+                    _worker_cache = Some(cache);
                     command
                 }
                 None => {
@@ -1156,6 +1164,66 @@ impl Drop for StagedDevelopmentSource {
     }
 }
 
+/// Worker-owned scratch backing the development worker's `XDG_CACHE_HOME` for
+/// one evaluation. Nix refuses to evaluate a flake without a writable fetcher
+/// cache, and the worker's HOME is deliberately the unwritable `/var/empty` —
+/// so the resolver hands it exactly one cache directory and reclaims it when
+/// the evaluation is over.
+struct WorkerCacheDirectory {
+    directory: PathBuf,
+}
+
+impl Drop for WorkerCacheDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn create_worker_cache_directory(
+    worker_user: &str,
+) -> Result<WorkerCacheDirectory, ResolutionError> {
+    let cache_error = |_| {
+        ResolutionError::new(
+            ErrorCategory::Internal,
+            "the development worker cache could not be prepared",
+            true,
+        )
+    };
+    let (uid, gid) = user_ids(worker_user).map_err(|_| {
+        ResolutionError::new(
+            ErrorCategory::Internal,
+            "development worker user could not be resolved",
+            false,
+        )
+    })?;
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    for _ in 0..128 {
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            ".imageless-dev-cache-{}-{nonce}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                let guard = WorkerCacheDirectory { directory: path };
+                std::fs::set_permissions(&guard.directory, std::fs::Permissions::from_mode(0o700))
+                    .map_err(cache_error)?;
+                let raw = CString::new(guard.directory.as_os_str().as_bytes())
+                    .map_err(|_| cache_error(io::Error::other("path contains NUL")))?;
+                if unsafe { libc::lchown(raw.as_ptr(), uid, gid) } != 0 {
+                    return Err(cache_error(io::Error::last_os_error()));
+                }
+                return Ok(guard);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(cache_error(error)),
+        }
+    }
+    Err(cache_error(io::Error::other(
+        "worker cache namespace exhausted",
+    )))
+}
+
 #[derive(Default)]
 struct StagingBudget {
     bytes: u64,
@@ -1174,13 +1242,17 @@ fn stage_development_installable(
         return Ok(None);
     };
     let worker_gid = match worker_user {
-        Some(worker_user) => user_gid(worker_user).map_err(|_| {
-            ResolutionError::new(
-                ErrorCategory::Internal,
-                "development worker user could not be resolved",
-                false,
-            )
-        })?,
+        Some(worker_user) => {
+            user_ids(worker_user)
+                .map_err(|_| {
+                    ResolutionError::new(
+                        ErrorCategory::Internal,
+                        "development worker user could not be resolved",
+                        false,
+                    )
+                })?
+                .1
+        }
         None => unsafe { libc::getegid() },
     };
     let directory = create_staging_directory(worker_gid)?;
@@ -1327,7 +1399,7 @@ fn set_staged_access(
     Ok(())
 }
 
-fn user_gid(name: &str) -> io::Result<libc::gid_t> {
+fn user_ids(name: &str) -> io::Result<(libc::uid_t, libc::gid_t)> {
     let name = CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid user name"))?;
     let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
@@ -1349,7 +1421,8 @@ fn user_gid(name: &str) -> io::Result<libc::gid_t> {
             io::Error::from_raw_os_error(status)
         });
     }
-    Ok(unsafe { entry.assume_init() }.pw_gid)
+    let entry = unsafe { entry.assume_init() };
+    Ok((entry.pw_uid, entry.pw_gid))
 }
 
 fn staging_error(_error: io::Error) -> ResolutionError {

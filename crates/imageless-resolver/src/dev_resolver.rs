@@ -22,7 +22,7 @@ const MAX_PROCESSES: libc::rlim_t = 1024;
 fn usage() -> ! {
     eprintln!(
         "usage: imageless-dev-resolver --user USER --nix ABSOLUTE_PATH \
-         --cpu-seconds 1..3600 --installable FLAKE#OUTPUT"
+         --cpu-seconds 1..3600 [--cache-home ABSOLUTE_PATH] --installable FLAKE#OUTPUT"
     );
     std::process::exit(2);
 }
@@ -35,6 +35,7 @@ fn main() {
     let mut user = None;
     let mut nix = None;
     let mut cpu_seconds = None;
+    let mut cache_home = None;
     let mut installable = None;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -44,6 +45,7 @@ fn main() {
             "--cpu-seconds" => {
                 cpu_seconds = Some(value(&mut args).parse::<u64>().unwrap_or_else(|_| usage()))
             }
+            "--cache-home" => cache_home = Some(PathBuf::from(value(&mut args))),
             "--installable" => installable = Some(value(&mut args)),
             "--help" | "-h" => usage(),
             _ => usage(),
@@ -58,6 +60,12 @@ fn main() {
         .filter(|value| valid_installable(value))
         .unwrap_or_else(|| usage());
     if !nix.is_absolute() || user.is_empty() || user.as_bytes().contains(&0) {
+        usage();
+    }
+    if cache_home
+        .as_ref()
+        .is_some_and(|cache_home| !cache_home.is_absolute())
+    {
         usage();
     }
 
@@ -93,6 +101,12 @@ fn main() {
             "PATH",
             option_env!("IMAGELESS_DEV_PATH").unwrap_or("/usr/bin:/bin"),
         );
+    // HOME stays unwritable on purpose; the resolver hands the worker a
+    // dedicated cache directory instead, because flake evaluation refuses to
+    // run without a writable fetcher cache.
+    if let Some(cache_home) = &cache_home {
+        command.env("XDG_CACHE_HOME", cache_home);
+    }
     if let Some(certificates) = option_env!("IMAGELESS_DEV_SSL_CERT_FILE") {
         command.env("SSL_CERT_FILE", certificates);
         command.env("NIX_SSL_CERT_FILE", certificates);
