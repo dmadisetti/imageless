@@ -69,6 +69,7 @@ pub fn request_resolution_detailed(
 /// with no in-tree caller: the daemon implements inspection (closure reports
 /// for prewarm/audit tooling), and this is the only supported way to speak that
 /// side of the protocol. Removing it would leave a server-only feature.
+#[cfg_attr(not(feature = "daemon"), allow(dead_code))]
 pub fn request_inspection(
     socket_path: &Path,
     request: &ResolveRequest,
@@ -282,6 +283,7 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     }
 }
 
+#[cfg_attr(not(feature = "daemon"), allow(dead_code))]
 pub fn peer_allowed(peer: u32, daemon: u32) -> bool {
     peer == daemon
 }

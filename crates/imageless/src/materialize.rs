@@ -53,6 +53,7 @@ impl ResolvePurpose {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ErrorCategory {
     Protocol,
     Unauthorized,
@@ -112,6 +113,7 @@ impl std::error::Error for ResolutionError {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResolveResponse {
     Success {
         version: u32,

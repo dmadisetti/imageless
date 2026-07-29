@@ -522,7 +522,9 @@
             # README.md is compiled as a doc-test (crates/imageless/src/lib.rs).
             fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./crates ./README.md ];
           };
-          # Workspace-wide gate: fails on any rustfmt drift or clippy warning.
+          # Workspace-wide gate: fails on any rustfmt drift or clippy warning,
+          # and on the library crate becoming unpackageable — publishing is a
+          # release step, staying publishable is a merge gate.
           lint = pkgs.stdenv.mkDerivation {
             name = "imageless-lint";
             inherit src;
@@ -538,6 +540,7 @@
               export HOME=$TMPDIR
               cargo fmt --check
               cargo clippy --workspace --all-targets --offline -- -D warnings
+              cargo package -p imageless --offline --no-verify
             '';
             installPhase = "touch $out";
           };
