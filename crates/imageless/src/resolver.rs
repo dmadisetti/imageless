@@ -271,6 +271,7 @@ struct SelectedRelease {
     cache: CachePolicy,
 }
 
+#[cfg_attr(not(feature = "daemon"), allow(dead_code))]
 impl Resolver {
     pub fn new(config: ResolverConfig) -> Self {
         assert!((1..=64).contains(&config.max_realizations));
@@ -1441,6 +1442,7 @@ fn staging_limit(kind: &str) -> ResolutionError {
     )
 }
 
+#[cfg_attr(not(feature = "daemon"), allow(dead_code))]
 pub fn handle_connection(
     mut stream: UnixStream,
     resolver: &Resolver,
@@ -1505,6 +1507,7 @@ pub fn handle_connection(
     write_frame(&mut stream, &response)
 }
 
+#[cfg_attr(not(feature = "daemon"), allow(dead_code))]
 pub fn serve(socket_path: &Path, resolver: Resolver) -> io::Result<()> {
     let parent = socket_path
         .parent()

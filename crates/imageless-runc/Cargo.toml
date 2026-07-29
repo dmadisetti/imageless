@@ -5,6 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "runc-compatible imageless interposer for Docker and other OCI callers"
+# Deployed from the flake; the crates.io artifact is the library.
+publish = false
 
 [[bin]]
 name = "imageless-runc"

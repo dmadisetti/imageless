@@ -12,6 +12,11 @@ description = "Materialize a Nix flake carried in OCI image layers into the cont
 # trust anchor is the daemon environment rather than a file's ownership. Intended
 # for local/dev hosts (e.g. the dev Docker harness), never for a shared node.
 inline-policy = []
+# Exports the resolver daemon and its socket wire protocol (`serve`,
+# `handle_connection`, frame IO, `PROTOCOL_VERSION`). That surface versions on
+# its own handshake, not on this crate's semver; only `imageless-resolver`
+# should need it.
+daemon = []
 
 [dependencies]
 serde = { workspace = true }

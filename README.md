@@ -150,21 +150,18 @@ The shim is a ~200-line consumer of the `imageless` crate. A runtime that owns
 its `create` path can skip the interposer entirely:
 
 ```rust
-use imageless::{remove_bundle_gc_roots, resolve_and_apply_bundle, MaterializerConfig};
+use imageless::{prepare_bundle, remove_bundle_gc_roots, PrepareBundle};
 use std::path::Path;
 
 /// Call during OCI `create`, once the bundle is staged.
 fn create(bundle: &Path) -> std::io::Result<()> {
+    // Defaults: output `rootfs`, 300 s timeout, and the materializer picked by
+    // the environment — the daemon socket when IMAGELESS_RESOLVER_SOCKET is
+    // set, in-process under the IMAGELESS_POLICY file otherwise. Override the
+    // struct's fields to make any of that explicit.
+    let request = PrepareBundle::new(bundle.join("config.json"), bundle);
     // Ok(None) => not an imageless bundle; proceed unchanged.
-    let _applied = resolve_and_apply_bundle(
-        &bundle.join("config.json"),
-        bundle,
-        "rootfs", // default flake output when the image names none
-        300,      // materialization timeout, seconds
-        // Socket(path) for the daemon, InProcess(policy) for daemonless;
-        // from_environment() picks by IMAGELESS_RESOLVER_SOCKET / IMAGELESS_POLICY.
-        &MaterializerConfig::from_environment(),
-    )?;
+    let _applied = prepare_bundle(&request)?;
     Ok(())
 }
 

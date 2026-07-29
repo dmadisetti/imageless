@@ -1,9 +1,6 @@
 //! runc-compatible imageless interposer for Docker and other OCI callers.
 
-use imageless::{
-    export_timing_events, remove_bundle_gc_roots, resolve_and_apply_bundle_detailed,
-    MaterializerConfig,
-};
+use imageless::{export_timing_events, prepare_bundle, remove_bundle_gc_roots, PrepareBundle};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -150,15 +147,11 @@ fn main() {
     let mut applied = None;
 
     if let Some(bundle) = &bundle {
-        let timeout = timeout_seconds().unwrap_or_else(|error| fail(error, 1));
-        let resolution = resolve_and_apply_bundle_detailed(
-            &bundle.join("config.json"),
-            bundle,
-            &default_output(),
-            timeout,
-            &MaterializerConfig::from_environment(),
-        )
-        .unwrap_or_else(|error| fail(format_args!("bundle selection failed: {error}"), 1));
+        let mut prepare = PrepareBundle::new(bundle.join("config.json"), bundle);
+        prepare.default_output = default_output();
+        prepare.timeout_seconds = timeout_seconds().unwrap_or_else(|error| fail(error, 1));
+        let resolution = prepare_bundle(&prepare)
+            .unwrap_or_else(|error| fail(format_args!("bundle selection failed: {error}"), 1));
         if let Some(resolution) = resolution {
             if let Some(path) = nonempty(TELEMETRY_ENV) {
                 let timings = &resolution.timings;

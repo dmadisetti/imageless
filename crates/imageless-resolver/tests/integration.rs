@@ -6,7 +6,6 @@
 //! locate `imageless-runc` as a sibling artifact in the target directory. Run
 //! them with a workspace-level `cargo test` so all three binaries are built.
 
-use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,46 +22,46 @@ struct TestRelease {
 
 impl TestRelease {
     fn new(dir: &Path) -> Self {
-        Self::with_selectors(dir, imageless::Selectors::default())
+        Self::with_selectors(dir, serde_json::json!({}))
     }
 
-    fn with_selectors(dir: &Path, selectors: imageless::Selectors) -> Self {
-        let manifest = imageless::ReleaseManifest {
-            schema: imageless::RELEASE_SCHEMA.to_string(),
-            issuer: "test".to_string(),
-            name: "rootfs".to_string(),
-            selectors,
-            targets: BTreeMap::from([(
-                "x86_64-linux".to_string(),
-                imageless::ReleaseTarget {
-                    rootfs: STORE_PATH.to_string(),
-                    cache: "local".to_string(),
-                    process: Some(imageless::ProcessMetadata {
-                        entrypoint: Some(vec!["/bin/agent".to_string()]),
-                        default_args: Some(vec!["serve".to_string()]),
-                        working_directory: Some("/workspace".to_string()),
-                        environment: vec![
-                            imageless::EnvironmentEntry {
-                                name: "LOCKED".to_string(),
-                                value: "release".to_string(),
-                                allow_workload_override: false,
+    fn with_selectors(dir: &Path, selectors: serde_json::Value) -> Self {
+        // The manifest and policy families are non-exhaustive outside the
+        // library, so the fixtures are built the way real inputs arrive: as
+        // JSON through serde.
+        let manifest: imageless::ReleaseManifest = serde_json::from_value(serde_json::json!({
+            "schema": imageless::RELEASE_SCHEMA,
+            "issuer": "test",
+            "name": "rootfs",
+            "selectors": selectors,
+            "targets": {
+                "x86_64-linux": {
+                    "rootfs": STORE_PATH,
+                    "cache": "local",
+                    "process": {
+                        "entrypoint": ["/bin/agent"],
+                        "default_args": ["serve"],
+                        "working_directory": "/workspace",
+                        "environment": [
+                            {
+                                "name": "LOCKED",
+                                "value": "release",
+                                "allow_workload_override": false,
                             },
-                            imageless::EnvironmentEntry {
-                                name: "TERM".to_string(),
-                                value: "release".to_string(),
-                                allow_workload_override: true,
+                            {
+                                "name": "TERM",
+                                "value": "release",
+                                "allow_workload_override": true,
                             },
                         ],
-                    }),
-                    mounts: vec![imageless::StoreMount {
-                        source: STORE_MOUNT_PATH.to_string(),
-                        destination: "/opt/tools".to_string(),
-                    }],
+                    },
+                    "mounts": [
+                        { "source": STORE_MOUNT_PATH, "destination": "/opt/tools" },
+                    ],
                 },
-            )]),
-            sbom: None,
-            provenance: None,
-        };
+            },
+        }))
+        .unwrap();
         let bytes = imageless::canonical_manifest_bytes(&manifest).unwrap();
         let digest = imageless::manifest_digest(&bytes);
         let catalog = dir.join("catalog");
@@ -71,27 +70,26 @@ impl TestRelease {
         std::fs::create_dir(&digest_directory).unwrap();
         std::fs::write(digest_directory.join(format!("{digest}.json")), bytes).unwrap();
 
-        let policy = imageless::ResolverPolicy {
-            system: "x86_64-linux".to_string(),
-            cache_only: true,
-            eval_allowed_uri_prefixes: Vec::new(),
-            issuers: HashMap::from([(
-                "test".to_string(),
-                imageless::IssuerPolicy {
-                    source: imageless::ManifestSource::Local {
-                        directory: std::fs::canonicalize(catalog).unwrap(),
+        let policy = serde_json::json!({
+            "system": "x86_64-linux",
+            "cache_only": true,
+            "eval_allowed_uri_prefixes": [],
+            "issuers": {
+                "test": {
+                    "source": {
+                        "kind": "local",
+                        "directory": std::fs::canonicalize(catalog).unwrap(),
                     },
-                    allowed_releases: vec!["rootfs".to_string()],
-                    caches: HashMap::from([(
-                        "local".to_string(),
-                        imageless::CachePolicy {
-                            substituter: "file:///nix/store".to_string(),
-                            public_keys: Vec::new(),
+                    "allowed_releases": ["rootfs"],
+                    "caches": {
+                        "local": {
+                            "substituter": "file:///nix/store",
+                            "public_keys": [],
                         },
-                    )]),
+                    },
                 },
-            )]),
-        };
+            },
+        });
         let policy_path = dir.join("policy.json");
         std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
         std::fs::set_permissions(
@@ -110,12 +108,12 @@ impl TestRelease {
     }
 
     fn development_policy(dir: &Path) -> PathBuf {
-        let policy = imageless::ResolverPolicy {
-            system: "x86_64-linux".to_string(),
-            cache_only: false,
-            eval_allowed_uri_prefixes: vec!["path:".to_string()],
-            issuers: HashMap::new(),
-        };
+        let policy = serde_json::json!({
+            "system": "x86_64-linux",
+            "cache_only": false,
+            "eval_allowed_uri_prefixes": ["path:"],
+            "issuers": {},
+        });
         let path = dir.join("development-policy.json");
         std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))

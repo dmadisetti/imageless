@@ -117,6 +117,7 @@ pub(crate) fn valid_release_name(value: &str) -> bool {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Selectors {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub containers: Vec<String>,
@@ -136,6 +137,7 @@ impl Selectors {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ReleaseManifest {
     pub schema: String,
     pub issuer: String,
@@ -155,6 +157,7 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct EvidenceReference {
     pub uri: String,
     pub sha256: String,
@@ -162,6 +165,7 @@ pub struct EvidenceReference {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ReleaseTarget {
     pub rootfs: String,
     pub cache: String,
@@ -173,6 +177,7 @@ pub struct ReleaseTarget {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ProcessMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
@@ -186,6 +191,7 @@ pub struct ProcessMetadata {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct EnvironmentEntry {
     pub name: String,
     pub value: String,
@@ -195,12 +201,14 @@ pub struct EnvironmentEntry {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct StoreMount {
     pub source: String,
     pub destination: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct ResolvedRelease {
     pub identity: String,
     pub rootfs: String,
@@ -466,6 +474,7 @@ fn map_contract_error(error: ContractError) -> ResolutionError {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ResolverPolicy {
     pub system: String,
     // When true the node resolves digest-addressed releases only (substitute a
@@ -486,6 +495,7 @@ fn default_cache_only() -> bool {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct IssuerPolicy {
     pub source: ManifestSource,
     #[serde(default)]
@@ -508,6 +518,7 @@ impl IssuerPolicy {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum ManifestSource {
     Local { directory: PathBuf },
     Https { base_url: String },
@@ -515,6 +526,7 @@ pub enum ManifestSource {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CachePolicy {
     pub substituter: String,
     #[serde(default)]

@@ -1,7 +1,13 @@
 //! Shared annotation, protocol, resolver, and bundle-lifecycle implementation.
 //!
-//! The public API is deliberately flat: adapters (`imageless-runc`, embedding
-//! OCI runtimes) and the resolver daemon consume `imageless::*` directly.
+//! The public API is deliberately flat, in two tiers. The embedding tier —
+//! everything exported unconditionally — is what an OCI runtime needs to
+//! prepare bundles at `create` ([`prepare_bundle`]) and release them at
+//! `delete` ([`remove_bundle_gc_roots`]), plus the contract types and bounds
+//! those calls surface. The `daemon` feature adds the resolver daemon and its
+//! wire protocol, which version on their own handshake and are not part of
+//! the deployment interface (SPEC §8); only `imageless-resolver` should need
+//! it.
 
 mod bundle;
 mod client;
@@ -14,10 +20,10 @@ mod resolver;
 mod spec;
 
 pub use bundle::{
-    apply_resolution, apply_resolution_with_projection, export_timing_events,
-    resolve_and_apply_bundle, resolve_and_apply_bundle_detailed, rewrite_root_path,
-    AppliedResolution, BundleTimings, MaterializerConfig,
+    apply_resolution, apply_resolution_with_projection, export_timing_events, prepare_bundle,
+    rewrite_root_path, AppliedResolution, BundleTimings, MaterializerConfig, PrepareBundle,
 };
+#[cfg(feature = "daemon")]
 pub use client::{
     effective_uid, peer_allowed, peer_uid, read_frame, request_inspection,
     request_resolution_detailed, write_frame,
@@ -34,10 +40,9 @@ pub use release::{
     ReleaseManifest, ReleaseReference, ReleaseTarget, ResolvedRelease, ResolverPolicy, Selectors,
     StoreMount, MAX_MANIFEST_BYTES, RELEASE_SCHEMA,
 };
-pub use resolver::{
-    handle_connection, load_resolver_policy, resolve_in_process, serve, DevelopmentWorkerConfig,
-    PolicySource, Resolver, ResolverConfig, DEFAULT_POLICY_PATH,
-};
+#[cfg(feature = "daemon")]
+pub use resolver::{handle_connection, serve, DevelopmentWorkerConfig, Resolver, ResolverConfig};
+pub use resolver::{load_resolver_policy, resolve_in_process, PolicySource, DEFAULT_POLICY_PATH};
 pub use spec::{expansion_request, plan, validate_store_path};
 
 /// Compiles every Rust block in the repository README as a doc-test, so the
@@ -47,18 +52,32 @@ pub use spec::{expansion_request, plan, validate_store_path};
 #[doc = include_str!("../../../README.md")]
 pub struct ReadmeDoctests;
 
+// Daemon wire-protocol bounds: public only with the `daemon` feature — the
+// protocol versions on its own handshake and is not deployment interface.
+#[cfg(feature = "daemon")]
 pub const PROTOCOL_VERSION: u32 = 2;
+#[cfg(not(feature = "daemon"))]
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
+#[cfg(feature = "daemon")]
 pub const MAX_FRAME_BYTES: usize = 16 * 1024;
+#[cfg(not(feature = "daemon"))]
+pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024;
+#[cfg(feature = "daemon")]
 pub const MAX_CONNECTIONS: usize = 64;
+#[cfg(not(feature = "daemon"))]
+#[allow(dead_code)]
+pub(crate) const MAX_CONNECTIONS: usize = 64;
 pub const GC_ROOT_NAME: &str = ".imageless-rootfs-gcroot";
 pub const GC_ROOTS_DIR_NAME: &str = ".imageless-store-gcroots";
 pub const NIX_STORE_PATH: &str = "/nix/store";
 pub const EMBEDDED_FLAKE_PATH: &str = "etc/imageless/flake.nix";
 pub(crate) const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
-pub(crate) const MAX_ANNOTATION_VALUE_BYTES: usize = 4096;
-pub(crate) const MAX_SELECTOR_BYTES: usize = 1024;
-pub(crate) const MAX_STAGED_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
-pub(crate) const MAX_STAGED_SOURCE_ENTRIES: usize = 4096;
+// Contract bounds (SPEC §2.3, §3): public so client-side tooling enforces the
+// same limits the node does, byte for byte.
+pub const MAX_ANNOTATION_VALUE_BYTES: usize = 4096;
+pub const MAX_SELECTOR_BYTES: usize = 1024;
+pub const MAX_STAGED_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_STAGED_SOURCE_ENTRIES: usize = 4096;
 
 pub const SOURCE_ANNOTATION: &str = "run.imageless.source";
 pub const OUTPUT_ANNOTATION: &str = "run.imageless.output";

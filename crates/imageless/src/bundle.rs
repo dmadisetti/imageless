@@ -67,25 +67,34 @@ impl MaterializerConfig {
     }
 }
 
-/// Resolve an annotated OCI bundle through the configured materializer and
-/// atomically apply the returned image-like metadata. Both a standalone
-/// adapter and an embedding OCI runtime can call this seam; a socket-backed
-/// caller never gains authority to execute Nix.
-pub fn resolve_and_apply_bundle(
-    config_path: &Path,
-    bundle_path: &Path,
-    default_output: &str,
-    timeout_seconds: u64,
-    materializer: &MaterializerConfig,
-) -> io::Result<Option<ResolvedRelease>> {
-    resolve_and_apply_bundle_detailed(
-        config_path,
-        bundle_path,
-        default_output,
-        timeout_seconds,
-        materializer,
-    )
-    .map(|result| result.map(|result| result.resolution))
+/// One `create`-time preparation request: where the bundle lives and how to
+/// resolve it. Construct with [`PrepareBundle::new`] (the contract defaults)
+/// and override fields as deployment configuration requires. Non-exhaustive so
+/// later revisions can add knobs without breaking embedders.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct PrepareBundle {
+    pub config_path: PathBuf,
+    pub bundle_path: PathBuf,
+    /// Flake output attribute used when the image names none.
+    pub default_output: String,
+    /// Materialization deadline in seconds (SPEC §4.3, 1–3600).
+    pub timeout_seconds: u64,
+    pub materializer: MaterializerConfig,
+}
+
+impl PrepareBundle {
+    /// Contract defaults: output `rootfs`, a 300 s deadline, and the
+    /// environment-selected materializer.
+    pub fn new(config_path: impl Into<PathBuf>, bundle_path: impl Into<PathBuf>) -> Self {
+        Self {
+            config_path: config_path.into(),
+            bundle_path: bundle_path.into(),
+            default_output: "rootfs".to_string(),
+            timeout_seconds: 300,
+            materializer: MaterializerConfig::from_environment(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,26 +111,31 @@ pub struct AppliedResolution {
     pub timings: BundleTimings,
 }
 
-pub fn resolve_and_apply_bundle_detailed(
-    config_path: &Path,
-    bundle_path: &Path,
-    default_output: &str,
-    timeout_seconds: u64,
-    materializer: &MaterializerConfig,
-) -> io::Result<Option<AppliedResolution>> {
+/// Prepare an OCI bundle at `create`: select or pass through, materialize
+/// through the configured materializer, and atomically apply the returned
+/// image-like metadata. `Ok(None)` is passthrough — not an imageless bundle,
+/// nothing touched. Both a standalone adapter and an embedding OCI runtime
+/// call this seam; a socket-backed caller never gains authority to execute
+/// Nix.
+pub fn prepare_bundle(prepare: &PrepareBundle) -> io::Result<Option<AppliedResolution>> {
     let selection_started = Instant::now();
-    let Some(request) =
-        expansion_request(config_path, bundle_path, default_output, timeout_seconds)?
+    let Some(request) = expansion_request(
+        &prepare.config_path,
+        &prepare.bundle_path,
+        &prepare.default_output,
+        prepare.timeout_seconds,
+    )?
     else {
         return Ok(None);
     };
     let selection_us = elapsed_us(selection_started);
-    let success = materializer
+    let success = prepare
+        .materializer
         .resolve(&request)
         .map_err(|error| io::Error::other(format!("resolution failed: {error}")))?;
     let rewrite_started = Instant::now();
-    if let Err(error) = apply_resolution(config_path, &success.resolution) {
-        let _ = remove_bundle_gc_roots(bundle_path);
+    if let Err(error) = apply_resolution(&prepare.config_path, &success.resolution) {
+        let _ = remove_bundle_gc_roots(&prepare.bundle_path);
         return Err(io::Error::new(
             error.kind(),
             format!("{:?}: {error}", ErrorCategory::SpecConflict),
@@ -468,16 +482,12 @@ mod tests {
         let before = std::fs::read(&config).unwrap();
         // A bundle with no imageless annotations and no embedded flake must
         // pass through even when the configured policy file cannot exist.
-        let result = resolve_and_apply_bundle_detailed(
-            &config,
-            &dir,
-            "rootfs",
-            5,
-            &MaterializerConfig::InProcess(PolicySource::File(Some(PathBuf::from(
-                "/nonexistent/imageless-policy.json",
-            )))),
-        )
-        .unwrap();
+        let mut prepare = PrepareBundle::new(&config, &dir);
+        prepare.timeout_seconds = 5;
+        prepare.materializer = MaterializerConfig::InProcess(PolicySource::File(Some(
+            PathBuf::from("/nonexistent/imageless-policy.json"),
+        )));
+        let result = prepare_bundle(&prepare).unwrap();
         assert!(result.is_none());
         assert_eq!(std::fs::read(&config).unwrap(), before);
         std::fs::remove_dir_all(dir).unwrap();

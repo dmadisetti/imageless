@@ -5,6 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "imageless resolver daemon and unprivileged development evaluator"
+# Deployed from the flake; the crates.io artifact is the library.
+publish = false
 
 [[bin]]
 name = "imageless-resolver"
@@ -15,7 +17,7 @@ name = "imageless-dev-resolver"
 path = "src/dev_resolver.rs"
 
 [dependencies]
-imageless = { path = "../imageless" }
+imageless = { path = "../imageless", features = ["daemon"] }
 libc = "0.2"
 
 [dev-dependencies]
