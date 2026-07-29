@@ -29,8 +29,14 @@ jobs:
       # The rootless leg of the compatibility matrix (ROADMAP v0.2): the
       # store-projection shape must run under a completely stock runc with
       # no privileges — executed here, not just built, as the runner user.
+      # Ubuntu's AppArmor restriction confines unprivileged user namespaces
+      # (runc stage-1 gets EPERM unsharing the remaining namespaces); the
+      # sysctl restores upstream kernel behavior so the smoke itself stays
+      # unprivileged.
       - name: rootless stock-runc projection-shape smoke
-        run: nix run -L .#stock-oci-smoke
+        run: |
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          nix run -L .#stock-oci-smoke
 
   # The two acceptance gates are NixOS VM tests and need KVM. GitHub-hosted
   # Linux runners expose /dev/kvm; the guard below fails LOUDLY if that ever
