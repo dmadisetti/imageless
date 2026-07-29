@@ -271,6 +271,7 @@
               pkgs.cri-tools
               pkgs.findutils
               pkgs.gnugrep
+              pkgs.gzip
               pkgs.jq
               pkgs.nix
               pkgs.util-linux
