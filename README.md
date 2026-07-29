@@ -144,6 +144,48 @@ Be precise about this, because the two deployment shapes differ:
 Release-profile materialization (digest-addressed, from allow-listed issuers
 and caches) substitutes rather than evaluates and is the same on both paths.
 
+## External flake references
+
+The embedded flake is the default trust model, but a pod may instead point the
+node at a flake it does not carry: set `run.imageless.source` to a flake
+reference with an explicit remote scheme (`github:`, `git+https:`,
+`tarball+https:`, …). The node opts in per prefix — this is evaluation, so it
+needs `cache_only: false` *and* the reference's prefix allow-listed:
+
+```json
+{
+  "system": "x86_64-linux",
+  "cache_only": false,
+  "eval_allowed_uri_prefixes": ["path:", "github:yourorg/"],
+  "issuers": {}
+}
+```
+
+(`examples/external-refs-policy.json`; `path:` keeps embedded flakes working —
+it authorizes the runtime's own rewrite of staged in-image sources, never a
+node path named by an annotation.) Two rules save real pain:
+
+- **Terminate prefixes at a boundary.** Matching is a literal string prefix:
+  `github:yourorg` also authorizes `github:yourorg-evil/anything`; write
+  `github:yourorg/`.
+- **Pin anything you would redeploy.** A mutable ref is not a deployment
+  identity — the same annotation can materialize different software tomorrow.
+  Pin with an explicit revision or content hash, and remember the referenced
+  flake's *own* unlocked inputs still resolve at evaluation time (its committed
+  `flake.lock` is honored; pinning the top-level ref pins nothing else):
+
+```yaml
+# examples/pod-external-ref.yaml — the annotation, pinned
+run.imageless.source: "github:yourorg/yourapp/8b7c95329f0a143adf971a0f27a4a0af8ddf9d5b"
+run.imageless.output: "rootfs"
+```
+
+The node does not police pin forms — that is authoring tooling's job — and
+production deployments should not ride this mode at all: they resolve
+digest-addressed releases (`imageless.run/release-v1`), where identity is a
+digest, not a ref. External references are the development and trusted-cluster
+convenience, gated so a node operator can keep them off entirely.
+
 ## Embedding the library
 
 The shim is a ~200-line consumer of the `imageless` crate. A runtime that owns

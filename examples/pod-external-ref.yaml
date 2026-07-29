@@ -1,0 +1,28 @@
+# An external-flake-reference workload (SPEC.md §3): the pod names a flake the
+# image does not carry, and the node evaluates it. This is the development /
+# trusted-cluster mode — the node must opt in with `cache_only: false` AND an
+# allow-listed prefix (examples/external-refs-policy.json); production
+# deployments use digest-addressed releases (pod-imageless.yaml) instead.
+#
+# The reference is pinned to a commit. A mutable ref (`github:yourorg/yourapp`)
+# is not a deployment identity: pin with a revision (`/COMMIT` or `?rev=`) or a
+# content hash (`?narHash=`). The referenced flake's committed flake.lock is
+# honored as written; inputs it left unlocked still resolve at evaluation time.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: imageless-external-ref
+  annotations:
+    run.imageless.source: "github:yourorg/yourapp/8b7c95329f0a143adf971a0f27a4a0af8ddf9d5b"
+    run.imageless.output: "rootfs"
+    run.imageless.containers: "app"
+spec:
+  runtimeClassName: imageless
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: localhost/imageless-placeholder:v1
+      resources:
+        limits:
+          memory: "2Gi"
+          cpu: "1"
