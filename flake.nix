@@ -302,7 +302,7 @@
           # instance pins one containerd generation and carries the settings
           # shape that generation expects, so a containerd change can never
           # silently invalidate the conformance claim for the other one.
-          mkCriVm = { containerdPackage ? null, sandboxImageSettings, nameSuffix ? "" }:
+          mkCriVm = { containerdPackage ? null, criSettings, nameSuffix ? "" }:
             pkgs.testers.runNixOSTest (
             let
               criSmoke =
@@ -350,7 +350,7 @@
                 # locally-imported smoke image — through that generation's
                 # settings shape — so RunPodSandbox resolves locally instead
                 # of pulling the containerd default from registry.k8s.io.
-                virtualisation.containerd.settings = sandboxImageSettings;
+                virtualisation.containerd.settings = criSettings;
 
                 # The smoke GCs the disposable rootfs and asserts the reboot
                 # reclaims it, then re-realises it in-guest. Three pieces keep
@@ -517,7 +517,7 @@
             # Primary pin: containerd 2.x straight from the flake's nixpkgs.
             # 2.x reads its sandbox pin from the CRI image-service plugin
             # table.
-            sandboxImageSettings.plugins."io.containerd.cri.v1.images".pinned_images.sandbox =
+            criSettings.plugins."io.containerd.cri.v1.images".pinned_images.sandbox =
               "localhost/imageless-smoke:phase0";
           };
           imageless-cri-vm-containerd1 = mkCriVm {
@@ -525,8 +525,14 @@
             # 1.x predates the split image-service plugin; its sandbox pin
             # is `sandbox_image` on the monolithic CRI plugin.
             containerdPackage = nixpkgs-containerd1.legacyPackages.${system}.containerd;
-            sandboxImageSettings.plugins."io.containerd.grpc.v1.cri".sandbox_image =
-              "localhost/imageless-smoke:phase0";
+            criSettings.plugins."io.containerd.grpc.v1.cri" = {
+              sandbox_image = "localhost/imageless-smoke:phase0";
+              # 1.x refuses to load the CRI plugin unless the default
+              # runtime it names (runc) is configured explicitly — 2.x
+              # synthesizes this entry. The runc binary comes from the
+              # containerd unit's PATH (the module wires pkgs.runc there).
+              containerd.runtimes.runc.runtime_type = "io.containerd.runc.v2";
+            };
             nameSuffix = "-containerd1";
           };
 
