@@ -26,6 +26,11 @@ jobs:
         run: nix flake metadata --no-update-lock-file
       - name: all checks build (lint, module eval, every package; workspace build runs cargo test)
         run: nix flake check -L
+      # The rootless leg of the compatibility matrix (ROADMAP v0.2): the
+      # store-projection shape must run under a completely stock runc with
+      # no privileges — executed here, not just built, as the runner user.
+      - name: rootless stock-runc projection-shape smoke
+        run: nix run -L .#stock-oci-smoke
 
   # The two acceptance gates are NixOS VM tests and need KVM. GitHub-hosted
   # Linux runners expose /dev/kvm; the guard below fails LOUDLY if that ever
@@ -41,5 +46,7 @@ jobs:
         run: test -e /dev/kvm || { echo "::error::/dev/kvm missing — acceptance gates cannot run"; exit 1; }
       - name: docker embedded-layer gate (daemonless, in-process materializer)
         run: nix build -L .#docker-embedded-smoke
-      - name: CRI lifecycle gate (resolver-daemon materializer)
+      - name: CRI lifecycle gate (resolver-daemon materializer, containerd 2.x)
         run: nix build -L .#imageless-cri-vm
+      - name: CRI lifecycle gate (compatibility leg, containerd 1.x)
+        run: nix build -L .#imageless-cri-vm-containerd1
