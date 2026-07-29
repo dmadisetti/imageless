@@ -360,8 +360,8 @@ mod tests {
         // ordinary annotation with no special handling.
         for (field, value) in [
             ("com.example.team", "platform"),
-            ("imageless.dev/release-v1", RELEASE_REF),
-            ("dev.imageless.source", "/etc/imageless"),
+            ("example.run/release-v1", RELEASE_REF),
+            ("run.example.source", "/etc/imageless"),
             ("run.imageless.closure", STORE),
         ] {
             assert_eq!(
