@@ -191,6 +191,10 @@ pointers is non-conforming.
 The publisher that produces manifests is out of scope for this spec; any CI
 that can copy a Nix closure to a cache and emit the manifest JSON conforms.
 
+Non-normative reservation: a future revision is expected to add detached
+signatures over the canonical manifest bytes as `sha256/<digest>.json.minisig`
+sidecars. Catalogs should not use that name for anything else.
+
 ## 7. Conformance
 
 An implementation conforms when it passes the acceptance gates in this
@@ -203,3 +207,65 @@ repository:
 2. **Kubernetes CRI lifecycle** — a real containerd node with a
    `RuntimeClass`, proving sandbox passthrough, per-container selection,
    recreate, GC-while-running, delete-and-collect, and reboot recovery.
+
+Conformance evidence — who has passed which gate against which pinned
+component versions, and which spec sections have been exercised by real
+deployments — is recorded in `CONFORMANCE.md`.
+
+## 8. Stability and deprecation
+
+This section binds when the status line above reads **frozen**. Until then
+v0.x is greenfield: identifiers may still be renumbered or renamespaced, and
+there is no compatibility surface to deprecate.
+
+### 8.1 The frozen surface
+
+What freezes is the deployment interface — everything a conforming image,
+deployer, or runtime can observe:
+
+- The annotation names in §3 and their grammars: `run.imageless.source`,
+  `run.imageless.output`, `run.imageless.containers`,
+  `run.imageless.skip-containers`, `imageless.run/release-v1`,
+  `imageless.run/containers-v1`, `imageless.run/skip-containers-v1`; the
+  4096-byte value and 1024-byte selector limits; the external-reference
+  scheme rules.
+- The embedded convention (§2): `etc/imageless/flake.nix` as a regular file,
+  zero-config selection of `/etc/imageless#rootfs`, and the staging bounds
+  (16 MiB, 4096 entries, regular files and directories only, no symlinks).
+- The runtime obligations (§4), including both store projection modes and the
+  GC-root names (`.imageless-rootfs-gcroot`, `.imageless-store-gcroots/`).
+- The release profile (§6): the `imageless.release.v1` manifest schema,
+  canonical-JSON digest addressing, the `sha256/<digest>.json` catalog layout
+  and 64 KiB manifest cap, and the `refs/<name>/<channel>` index rules.
+
+Explicitly **not** part of the frozen surface:
+
+- the resolver wire protocol and `PROTOCOL_VERSION` — private to the
+  reference shim and its optional daemon, versioned by their handshake,
+  changeable in any release;
+- the node policy file (`/etc/imageless/policy.json`) schema — node-operator
+  configuration owned by the materializer implementation;
+- the `imageless` Rust crate API — governed by Cargo semver on its own clock;
+- diagnostic text and the timing-telemetry format.
+
+### 8.2 Changing the frozen surface
+
+- **Additive** changes — those that cannot change the outcome of any input a
+  frozen-spec consumer already produces (a new annotation, a new optional
+  manifest field, a new projection mode) — may land in a minor revision of
+  this document.
+- **Breaking** changes arrive as **new suffixed identifiers**
+  (`imageless.run/release-v2`); a frozen identifier's meaning is never
+  repurposed. The old identifier keeps its exact behavior through a
+  deprecation window of at least one minor release and six months, during
+  which a conforming runtime warns through its telemetry and diagnostics but
+  never silently changes the outcome. Removal is a major revision.
+- **Errata** — wording fixes with no observable behavior change — may amend
+  the text in place, recorded in an errata log appended to this document.
+
+### 8.3 Gates are spec
+
+§7 defines conformance as passing the acceptance gates, so once frozen, a
+gate change is a spec change. A gate may be strengthened in a minor revision
+only when every already-conforming implementation still passes; anything else
+is a breaking change and follows §8.2.
