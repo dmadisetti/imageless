@@ -13,7 +13,10 @@ permissions:
 
 jobs:
   # Lint + module eval + every package except the VM gates. A package that
-  # does not build is a broken release, so packages ARE checks.
+  # does not build is a broken release, so packages ARE checks — and CI
+  # builds the checks set itself (`nix flake check` builds every check
+  # derivation) instead of a hand-maintained list a new package could
+  # silently drift out of.
   build:
     runs-on: ubuntu-latest
     steps:
@@ -21,27 +24,8 @@ jobs:
       - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342
       - name: flake metadata is locked
         run: nix flake metadata --no-update-lock-file
-      - name: eval-only check
-        run: nix flake check --no-build
-      - name: lint (rustfmt + clippy -D warnings)
-        run: nix build -L .#checks.x86_64-linux.lint
-      - name: module eval assertions
-        run: nix build -L .#checks.x86_64-linux.module-eval
-      - name: packages (workspace build runs cargo test)
-        run: |
-          nix build -L \
-            .#imageless \
-            .#imageless-runc \
-            .#imageless-resolver \
-            .#docker-embedded-seed \
-            .#docker-embedded-image \
-            .#docker-passthrough-image \
-            .#placeholder-image \
-            .#smoke-image \
-            .#smoke-rootfs \
-            .#smoke-release \
-            .#imageless-cri-smoke \
-            .#stock-oci-smoke
+      - name: all checks build (lint, module eval, every package; workspace build runs cargo test)
+        run: nix flake check -L
 
   # The two acceptance gates are NixOS VM tests and need KVM. GitHub-hosted
   # Linux runners expose /dev/kvm; the guard below fails LOUDLY if that ever
