@@ -339,222 +339,222 @@
           # silently invalidate the conformance claim for the other one.
           mkCriVm = { containerdPackage ? null, criSettings, nameSuffix ? "" }:
             pkgs.testers.runNixOSTest (
-            let
-              criSmoke =
-                if containerdPackage == null
-                then imageless-cri-smoke
-                else mkCriSmoke containerdPackage;
-              nodeBase = { ... }: {
-                imports = [ self.nixosModules.imageless ];
-                # The containerd NixOS module hardcodes pkgs.containerd
-                # (no package option), so a compatibility leg swaps the
-                # node's generation through an overlay; pkgsReadOnly is
-                # lifted below only for those legs, keeping the primary
-                # gate's eval on the shared pkgs.
-                nixpkgs.overlays = lib.mkIf (containerdPackage != null) [
-                  (_final: _prev: { containerd = containerdPackage; })
-                ];
-                services.imageless = {
-                  enable = true;
-                  resolver.enable = true;
-                  # The gate must prove embedded-layer bootstrap — a flake
-                  # present only in the image layer selecting and
-                  # materializing — and that is node-side evaluation, opted
-                  # into exactly as a deployment would (SPEC.md §2.1). The
-                  # release-annotated workloads keep exercising the digest
-                  # path against this same policy, and evaluation runs
-                  # through the resolver's privilege-separated development
-                  # worker, which no other gate covers. The loopback tarball
-                  # prefix is the external-reference mode (SPEC.md §3): the
-                  # smoke serves the flake over guest-local HTTP, and any
-                  # OTHER external prefix stays un-listed so the smoke can
-                  # assert the deny path too.
-                  policy.cacheOnly = false;
-                  policy.evalAllowedUriPrefixes = [
-                    "path:"
-                    "tarball+http://127.0.0.1:8081/"
+              let
+                criSmoke =
+                  if containerdPackage == null
+                  then imageless-cri-smoke
+                  else mkCriSmoke containerdPackage;
+                nodeBase = { ... }: {
+                  imports = [ self.nixosModules.imageless ];
+                  # The containerd NixOS module hardcodes pkgs.containerd
+                  # (no package option), so a compatibility leg swaps the
+                  # node's generation through an overlay; pkgsReadOnly is
+                  # lifted below only for those legs, keeping the primary
+                  # gate's eval on the shared pkgs.
+                  nixpkgs.overlays = lib.mkIf (containerdPackage != null) [
+                    (_final: _prev: { containerd = containerdPackage; })
                   ];
-                  policy.issuers.imageless-smoke = {
-                    source = {
-                      kind = "local";
-                      directory = smoke-release;
-                    };
-                    allowedReleases = [ "cri" ];
-                    caches.local = {
-                      substituter = "file:///nix/store";
-                      publicKeys = [ ];
+                  services.imageless = {
+                    enable = true;
+                    resolver.enable = true;
+                    # The gate must prove embedded-layer bootstrap — a flake
+                    # present only in the image layer selecting and
+                    # materializing — and that is node-side evaluation, opted
+                    # into exactly as a deployment would (SPEC.md §2.1). The
+                    # release-annotated workloads keep exercising the digest
+                    # path against this same policy, and evaluation runs
+                    # through the resolver's privilege-separated development
+                    # worker, which no other gate covers. The loopback tarball
+                    # prefix is the external-reference mode (SPEC.md §3): the
+                    # smoke serves the flake over guest-local HTTP, and any
+                    # OTHER external prefix stays un-listed so the smoke can
+                    # assert the deny path too.
+                    policy.cacheOnly = false;
+                    policy.evalAllowedUriPrefixes = [
+                      "path:"
+                      "tarball+http://127.0.0.1:8081/"
+                    ];
+                    policy.issuers.imageless-smoke = {
+                      source = {
+                        kind = "local";
+                        directory = smoke-release;
+                      };
+                      allowedReleases = [ "cri" ];
+                      caches.local = {
+                        substituter = "file:///nix/store";
+                        publicKeys = [ ];
+                      };
                     };
                   };
+
+                  # The VM is hermetic (no network). Each matrix instance
+                  # points the pod-sandbox ("pause") image at the
+                  # locally-imported smoke image — through that generation's
+                  # settings shape — so RunPodSandbox resolves locally instead
+                  # of pulling the containerd default from registry.k8s.io.
+                  virtualisation.containerd.settings = criSettings;
+
+                  # The smoke GCs the disposable rootfs and asserts the reboot
+                  # reclaims it, then re-realises it in-guest. Three pieces keep
+                  # that honest, and each is load-bearing:
+                  #
+                  #  * additionalPaths seeds the rootfs .drv — and, because
+                  #    closure-info runs exportReferencesGraph over it, the
+                  #    OUTPUT path too — into the guest store and its boot-time
+                  #    registration. The output must be seeded wherever it is
+                  #    registered: registration alone leaves a valid-but-absent
+                  #    path that `nix-store --realise` happily no-ops on, and
+                  #    runc then delegates onto a rootfs that does not exist.
+                  #
+                  #  * The rebuild inputs — the .drv closure and every
+                  #    build-time output (inputDerivation) — are ALSO rooted
+                  #    through the system closure. additionalPaths registers
+                  #    without rooting, the smoke runs `nix-store --gc` itself
+                  #    (post-reboot BEFORE re-realising), and anything unrooted
+                  #    is collected, degrading the rebuild into an offline
+                  #    world-rebuild that dies on the first fetch. Only the
+                  #    rootfs OUTPUT stays unrooted: that is the disposable
+                  #    path whose collection the gate asserts.
+                  #
+                  #  * The writable store lives on the VM disk, not the default
+                  #    tmpfs upper layer, so what the post-reboot GC acts on is
+                  #    state that genuinely survived the reboot.
+                  system.extraDependencies = [
+                    smoke-rootfs.drvPath
+                    smoke-rootfs.inputDerivation
+                  ];
+                  virtualisation = {
+                    writableStore = true;
+                    writableStoreUseTmpfs = false;
+                    memorySize = 4096;
+                    cores = 2;
+                    diskSize = 8192;
+                    additionalPaths = [ smoke-rootfs.drvPath ];
+                  };
+
+                  # `jq` for the projection-shape assertions in the testScript.
+                  environment.systemPackages = [ criSmoke pkgs.jq ];
+
+                  # The retained witness workload (`sleep 600`, PID-ns init, so
+                  # it ignores SIGTERM) would otherwise hold each reboot at the
+                  # 90s default stop timeout before systemd-shutdown SIGKILLs it.
+                  systemd.settings.Manager.DefaultTimeoutStopSec = "10s";
                 };
-
-                # The VM is hermetic (no network). Each matrix instance
-                # points the pod-sandbox ("pause") image at the
-                # locally-imported smoke image — through that generation's
-                # settings shape — so RunPodSandbox resolves locally instead
-                # of pulling the containerd default from registry.k8s.io.
-                virtualisation.containerd.settings = criSettings;
-
-                # The smoke GCs the disposable rootfs and asserts the reboot
-                # reclaims it, then re-realises it in-guest. Three pieces keep
-                # that honest, and each is load-bearing:
-                #
-                #  * additionalPaths seeds the rootfs .drv — and, because
-                #    closure-info runs exportReferencesGraph over it, the
-                #    OUTPUT path too — into the guest store and its boot-time
-                #    registration. The output must be seeded wherever it is
-                #    registered: registration alone leaves a valid-but-absent
-                #    path that `nix-store --realise` happily no-ops on, and
-                #    runc then delegates onto a rootfs that does not exist.
-                #
-                #  * The rebuild inputs — the .drv closure and every
-                #    build-time output (inputDerivation) — are ALSO rooted
-                #    through the system closure. additionalPaths registers
-                #    without rooting, the smoke runs `nix-store --gc` itself
-                #    (post-reboot BEFORE re-realising), and anything unrooted
-                #    is collected, degrading the rebuild into an offline
-                #    world-rebuild that dies on the first fetch. Only the
-                #    rootfs OUTPUT stays unrooted: that is the disposable
-                #    path whose collection the gate asserts.
-                #
-                #  * The writable store lives on the VM disk, not the default
-                #    tmpfs upper layer, so what the post-reboot GC acts on is
-                #    state that genuinely survived the reboot.
-                system.extraDependencies = [
-                  smoke-rootfs.drvPath
-                  smoke-rootfs.inputDerivation
-                ];
-                virtualisation = {
-                  writableStore = true;
-                  writableStoreUseTmpfs = false;
-                  memorySize = 4096;
-                  cores = 2;
-                  diskSize = 8192;
-                  additionalPaths = [ smoke-rootfs.drvPath ];
+              in
+              {
+                name = "imageless-cri-lifecycle${nameSuffix}";
+                nodes.node = nodeBase;
+                nodes.closure = { ... }: {
+                  imports = [ nodeBase ];
+                  services.imageless.storeProjection = "closure";
                 };
+                testScript = ''
+                  # The driver passes qemu `-no-reboot` unless a machine is
+                  # started with allow_reboot, so the deliberate in-guest reboot
+                  # below would exit the VM and drop the backdoor shell. Boot
+                  # explicitly before wait_for_unit lazily boots without it.
+                  for machine in (node, closure):
+                      machine.start(allow_reboot=True)
 
-                # `jq` for the projection-shape assertions in the testScript.
-                environment.systemPackages = [ criSmoke pkgs.jq ];
+                  for machine in (node, closure):
+                      machine.wait_for_unit("imageless-resolver.service")
+                      machine.wait_for_unit("containerd.service")
 
-                # The retained witness workload (`sleep 600`, PID-ns init, so
-                # it ignores SIGTERM) would otherwise hold each reboot at the
-                # 90s default stop timeout before systemd-shutdown SIGKILLs it.
-                systemd.settings.Manager.DefaultTimeoutStopSec = "10s";
-              };
-            in
-            {
-              name = "imageless-cri-lifecycle${nameSuffix}";
-              nodes.node = nodeBase;
-              nodes.closure = { ... }: {
-                imports = [ nodeBase ];
-                services.imageless.storeProjection = "closure";
-              };
-              testScript = ''
-                # The driver passes qemu `-no-reboot` unless a machine is
-                # started with allow_reboot, so the deliberate in-guest reboot
-                # below would exit the VM and drop the backdoor shell. Boot
-                # explicitly before wait_for_unit lazily boots without it.
-                for machine in (node, closure):
-                    machine.start(allow_reboot=True)
+                  # Record the matrix cell in the gate log: conformance
+                  # evidence is per-version (CONFORMANCE.md), so the run must
+                  # state what it actually exercised.
+                  print("### MATRIX " + node.succeed(
+                      "containerd --version && nix --version"
+                  ))
 
-                for machine in (node, closure):
-                    machine.wait_for_unit("imageless-resolver.service")
-                    machine.wait_for_unit("containerd.service")
+                  def rewritten_bundle(machine):
+                      # The retained witness container from `pre-reboot` is
+                      # still running; its bundle is the one carrying the
+                      # imageless GC root (the pod sandbox is never rewritten).
+                      return machine.succeed(
+                          "dirname \"$(find "
+                          "/run/containerd/io.containerd.runtime.v2.task/k8s.io "
+                          "-name .imageless-rootfs-gcroot | head -1)\""
+                      ).strip()
 
-                # Record the matrix cell in the gate log: conformance
-                # evidence is per-version (CONFORMANCE.md), so the run must
-                # state what it actually exercised.
-                print("### MATRIX " + node.succeed(
-                    "containerd --version && nix --version"
-                ))
+                  def run_smoke(machine, phase):
+                      # On failure the smoke's EXIT trap tears the pod down, so
+                      # bundle dirs vanish — but the resolver journal and the
+                      # telemetry sink persist and are the decisive signal for
+                      # whether the shim ran per-container resolution at all.
+                      status, output = machine.execute(
+                          "imageless-cri-smoke " + phase + " 2>&1"
+                      )
+                      print(output)
+                      if status != 0:
+                          print("### DIAG " + machine.name + " " + phase + " ###")
+                          print("--- imageless-resolver journal ---")
+                          print(machine.execute(
+                              "journalctl -u imageless-resolver --no-pager "
+                              "--no-hostname | tail -n 80"
+                          )[1])
+                          print("--- resolver timings (/run/imageless/timings.jsonl) ---")
+                          print(machine.execute(
+                              "cat /run/imageless/timings.jsonl 2>&1"
+                          )[1])
+                          print("--- containerd journal (shim/imageless) ---")
+                          print(machine.execute(
+                              "journalctl -u containerd --no-pager --no-hostname | "
+                              "grep -iE 'imageless|shim start|bundle selection|"
+                              "gcroot|resolve|runc.v2' | tail -n 60"
+                          )[1])
+                          print("--- live task bundles ---")
+                          print(machine.execute(
+                              "ls -laR /run/containerd/io.containerd.runtime.v2.task"
+                              "/k8s.io/ 2>&1 | tail -n 80"
+                          )[1])
+                          raise Exception(
+                              machine.name + " imageless-cri-smoke " + phase + " failed"
+                          )
 
-                def rewritten_bundle(machine):
-                    # The retained witness container from `pre-reboot` is
-                    # still running; its bundle is the one carrying the
-                    # imageless GC root (the pod sandbox is never rewritten).
-                    return machine.succeed(
-                        "dirname \"$(find "
-                        "/run/containerd/io.containerd.runtime.v2.task/k8s.io "
-                        "-name .imageless-rootfs-gcroot | head -1)\""
-                    ).strip()
+                  # Full pre-reboot lifecycle on each backend: annotated
+                  # sandbox, selected init, unselected sidecar, main, live-GC
+                  # survival, CRI recreate, failed start, delete, then a
+                  # retained witness workload.
+                  run_smoke(node, "pre-reboot")
+                  run_smoke(closure, "pre-reboot")
 
-                def run_smoke(machine, phase):
-                    # On failure the smoke's EXIT trap tears the pod down, so
-                    # bundle dirs vanish — but the resolver journal and the
-                    # telemetry sink persist and are the decisive signal for
-                    # whether the shim ran per-container resolution at all.
-                    status, output = machine.execute(
-                        "imageless-cri-smoke " + phase + " 2>&1"
-                    )
-                    print(output)
-                    if status != 0:
-                        print("### DIAG " + machine.name + " " + phase + " ###")
-                        print("--- imageless-resolver journal ---")
-                        print(machine.execute(
-                            "journalctl -u imageless-resolver --no-pager "
-                            "--no-hostname | tail -n 80"
-                        )[1])
-                        print("--- resolver timings (/run/imageless/timings.jsonl) ---")
-                        print(machine.execute(
-                            "cat /run/imageless/timings.jsonl 2>&1"
-                        )[1])
-                        print("--- containerd journal (shim/imageless) ---")
-                        print(machine.execute(
-                            "journalctl -u containerd --no-pager --no-hostname | "
-                            "grep -iE 'imageless|shim start|bundle selection|"
-                            "gcroot|resolve|runc.v2' | tail -n 60"
-                        )[1])
-                        print("--- live task bundles ---")
-                        print(machine.execute(
-                            "ls -laR /run/containerd/io.containerd.runtime.v2.task"
-                            "/k8s.io/ 2>&1 | tail -n 80"
-                        )[1])
-                        raise Exception(
-                            machine.name + " imageless-cri-smoke " + phase + " failed"
-                        )
+                  # The node backend binds the whole store once and no
+                  # per-path store mounts.
+                  node.succeed(
+                      "jq -e '([.mounts[]|select(.destination==\"/nix/store\")]|length==1) "
+                      "and ([.mounts[]|select(.destination|startswith(\"/nix/store/\"))]|length==0)' "
+                      + rewritten_bundle(node) + "/config.json"
+                  )
+                  # The closure backend binds only per-path closure mounts, lays a
+                  # single empty tmpfs over /nix/store so those mountpoints can be
+                  # created in the read-only rootfs, and never binds the whole node
+                  # store.
+                  closure.succeed(
+                      "jq -e '([.mounts[]|select(.destination|startswith(\"/nix/store/\"))]|length>0) "
+                      "and ([.mounts[]|select(.destination==\"/nix/store\" and .type==\"tmpfs\")]|length==1) "
+                      "and ([.mounts[]|select(.destination==\"/nix/store\" and .type==\"bind\")]|length==0)' "
+                      + rewritten_bundle(closure) + "/config.json"
+                  )
 
-                # Full pre-reboot lifecycle on each backend: annotated
-                # sandbox, selected init, unselected sidecar, main, live-GC
-                # survival, CRI recreate, failed start, delete, then a
-                # retained witness workload.
-                run_smoke(node, "pre-reboot")
-                run_smoke(closure, "pre-reboot")
+                  for machine in (node, closure):
+                      machine.reboot()
+                      machine.wait_for_unit("containerd.service")
+                      machine.wait_for_unit("imageless-resolver.service")
 
-                # The node backend binds the whole store once and no
-                # per-path store mounts.
-                node.succeed(
-                    "jq -e '([.mounts[]|select(.destination==\"/nix/store\")]|length==1) "
-                    "and ([.mounts[]|select(.destination|startswith(\"/nix/store/\"))]|length==0)' "
-                    + rewritten_bundle(node) + "/config.json"
-                )
-                # The closure backend binds only per-path closure mounts, lays a
-                # single empty tmpfs over /nix/store so those mountpoints can be
-                # created in the read-only rootfs, and never binds the whole node
-                # store.
-                closure.succeed(
-                    "jq -e '([.mounts[]|select(.destination|startswith(\"/nix/store/\"))]|length>0) "
-                    "and ([.mounts[]|select(.destination==\"/nix/store\" and .type==\"tmpfs\")]|length==1) "
-                    "and ([.mounts[]|select(.destination==\"/nix/store\" and .type==\"bind\")]|length==0)' "
-                    + rewritten_bundle(closure) + "/config.json"
-                )
-
-                for machine in (node, closure):
-                    machine.reboot()
-                    machine.wait_for_unit("containerd.service")
-                    machine.wait_for_unit("imageless-resolver.service")
-
-                # Post-reboot on each backend: the /run bundle GC root is
-                # gone (tmpfs), GC reclaims the now-unrooted disposable
-                # rootfs, and a fresh workload still resolves.
-                run_smoke(node, "post-reboot")
-                run_smoke(closure, "post-reboot")
-              '';
-            } // lib.optionalAttrs (containerdPackage != null) {
-              # Only the overlay-carrying legs pay for their own nixpkgs
-              # evaluation; the primary instance keeps the shared read-only
-              # pkgs.
-              node.pkgsReadOnly = false;
-            }
-          );
+                  # Post-reboot on each backend: the /run bundle GC root is
+                  # gone (tmpfs), GC reclaims the now-unrooted disposable
+                  # rootfs, and a fresh workload still resolves.
+                  run_smoke(node, "post-reboot")
+                  run_smoke(closure, "post-reboot")
+                '';
+              } // lib.optionalAttrs (containerdPackage != null) {
+                # Only the overlay-carrying legs pay for their own nixpkgs
+                # evaluation; the primary instance keeps the shared read-only
+                # pkgs.
+                node.pkgsReadOnly = false;
+              }
+            );
           imageless-cri-vm = mkCriVm {
             # Primary pin: containerd 2.x straight from the flake's nixpkgs.
             # 2.x reads its sandbox pin from the CRI image-service plugin
@@ -707,13 +707,58 @@
               daemon.systemd.services.imageless-resolver.serviceConfig.ExecStart;
             assert daemon.users.users ? imageless-dev;
             pkgs.writeText "imageless-module-eval" "ok";
+          # dev/kind is executable documentation; lint what can drift: the
+          # setup script, the manifests, and the containerd patch, which must
+          # stay identical to the runtime table of
+          # examples/containerd-config.toml.
+          quickstart-lint =
+            let
+              image = self.packages.${system}.nginx-embedded-image;
+            in
+            pkgs.runCommand "imageless-quickstart-lint"
+              {
+                nativeBuildInputs = [ pkgs.shellcheck pkgs.yq-go pkgs.python3 ];
+                quickstart = lib.fileset.toSource {
+                  root = ./.;
+                  fileset = lib.fileset.unions [ ./dev/kind ./examples/containerd-config.toml ];
+                };
+                expectedImage = "${image.imageName}:${image.imageTag}";
+              }
+              ''
+                shellcheck "$quickstart/dev/kind/setup.sh"
+                yq eval '.' "$quickstart/dev/kind/kind-config.yaml" >/dev/null
+                yq eval '.' "$quickstart/dev/kind/pod-nginx-embedded.yaml" >/dev/null
+                test "$(yq eval '.spec.containers[0].image' "$quickstart/dev/kind/pod-nginx-embedded.yaml")" \
+                  = "$expectedImage"
+                yq eval '.containerdConfigPatches[0]' "$quickstart/dev/kind/kind-config.yaml" >patch.toml
+                python3 - "$quickstart" <<'PY'
+                import pathlib
+                import sys
+                import tomllib
+
+                source = pathlib.Path(sys.argv[1])
+
+                def runtime(config):
+                    plugins = config["plugins"]["io.containerd.cri.v1.runtime"]
+                    return plugins["containerd"]["runtimes"]["imageless"]
+
+                patch = tomllib.loads(pathlib.Path("patch.toml").read_text())
+                example = tomllib.loads(
+                    (source / "examples/containerd-config.toml").read_text()
+                )
+                assert runtime(patch) == runtime(example), (
+                    "dev/kind patch drifted from examples/containerd-config.toml"
+                )
+                PY
+                touch $out
+              '';
         in
         # Every package is a check (a package that doesn't build is a broken
-        # release), plus the lint/module-eval gates only checks carry. The two
-        # NixOS VM gates are deliberately absent from `packages` (they live under
-        # legacyPackages — see above), so they are naturally excluded here too.
+          # release), plus the lint/module-eval gates only checks carry. The two
+          # NixOS VM gates are deliberately absent from `packages` (they live under
+          # legacyPackages — see above), so they are naturally excluded here too.
         self.packages.${system} // {
-          inherit lint module-eval;
+          inherit lint module-eval quickstart-lint;
         });
 
       devShells = forAllSystems (system:
