@@ -49,10 +49,44 @@ fn default_output() -> String {
     nonempty(OUTPUT_ENV).unwrap_or_else(|| OUTPUT_BAKED.to_string())
 }
 
+/// runc global flags that consume a following value when written as
+/// `--flag value` (the `--flag=value` form carries its own value). Every other
+/// pre-subcommand token starting with `-` is a boolean switch (`--debug`,
+/// `--systemd-cgroup`, ...). This table exists only to walk past the global
+/// prefix and land on the subcommand token.
+const GLOBAL_VALUE_FLAGS: &[&str] = &["--root", "--log", "--log-format", "--criu", "--rootless"];
+
+/// Index of the runc subcommand: the first argv element that is neither a
+/// global flag nor the value of one. Searching argv for the literal string
+/// `create` instead would mis-locate the subcommand whenever a container ID,
+/// bundle path, or log path is itself named `create` — and then every later
+/// token, including a real `--bundle`, is parsed against the wrong offset.
+fn subcommand_index(arguments: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index].as_str();
+        if argument == "--" {
+            return (index + 1 < arguments.len()).then_some(index + 1);
+        }
+        if !argument.starts_with('-') {
+            return Some(index);
+        }
+        index += if GLOBAL_VALUE_FLAGS.contains(&argument) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
 fn create_bundle(arguments: &[String]) -> Result<Option<PathBuf>, String> {
-    let Some(create_index) = arguments.iter().position(|argument| argument == "create") else {
+    let Some(create_index) = subcommand_index(arguments) else {
         return Ok(None);
     };
+    if arguments[create_index] != "create" {
+        return Ok(None);
+    }
     let command_arguments = &arguments[create_index + 1..];
     for (index, argument) in command_arguments.iter().enumerate() {
         if argument == "--bundle" || argument == "-b" {
@@ -206,6 +240,60 @@ mod tests {
                 Some(PathBuf::from("/bundle"))
             );
         }
+    }
+
+    #[test]
+    fn a_container_id_named_create_is_not_the_subcommand() {
+        // `runc start create` starts a container whose ID is "create". The
+        // shim must not treat it as a create, and must not misread the
+        // remaining argv against that offset.
+        assert_eq!(create_bundle(&args(&["start", "create"])).unwrap(), None);
+        assert_eq!(create_bundle(&args(&["delete", "create"])).unwrap(), None);
+        assert_eq!(
+            create_bundle(&args(&["exec", "create", "--bundle", "/not-a-bundle"])).unwrap(),
+            None
+        );
+        // A global flag whose value is "create" likewise names no subcommand.
+        assert_eq!(
+            create_bundle(&args(&["--root", "create", "state", "id"])).unwrap(),
+            None
+        );
+        // ...and a real create with a bundle path named "create" still parses.
+        assert_eq!(
+            create_bundle(&args(&[
+                "--root", "create", "create", "--bundle", "/b", "create"
+            ]))
+            .unwrap(),
+            Some(PathBuf::from("/b"))
+        );
+    }
+
+    #[test]
+    fn walks_past_global_flag_forms() {
+        for arguments in [
+            args(&[
+                "--debug",
+                "--systemd-cgroup",
+                "create",
+                "-b",
+                "/bundle",
+                "id",
+            ]),
+            args(&["--log=/tmp/log", "create", "-b", "/bundle", "id"]),
+            args(&[
+                "--log", "/tmp/log", "--debug", "create", "-b", "/bundle", "id",
+            ]),
+            args(&["--rootless", "true", "create", "-b", "/bundle", "id"]),
+        ] {
+            assert_eq!(
+                create_bundle(&arguments).unwrap(),
+                Some(PathBuf::from("/bundle"))
+            );
+        }
+        // Global flags with no subcommand at all.
+        assert_eq!(create_bundle(&args(&["--version"])).unwrap(), None);
+        assert_eq!(create_bundle(&args(&[])).unwrap(), None);
+        assert_eq!(create_bundle(&args(&["--root"])).unwrap(), None);
     }
 
     #[test]

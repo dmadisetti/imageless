@@ -4,7 +4,6 @@ use crate::materialize::{
     ClosureReport, ErrorCategory, ResolutionError, ResolutionSuccess, ResolvePurpose,
     ResolveRequest, ResolveResponse,
 };
-use crate::release::ResolvedRelease;
 use crate::spec::validate_store_path;
 use crate::{to_io, MAX_FRAME_BYTES, PROTOCOL_VERSION};
 use serde::de::DeserializeOwned;
@@ -44,13 +43,6 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<T> 
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-pub fn request_resolution(
-    socket_path: &Path,
-    request: &ResolveRequest,
-) -> Result<ResolvedRelease, ResolutionError> {
-    request_resolution_detailed(socket_path, request).map(|success| success.resolution)
-}
-
 pub fn request_resolution_detailed(
     socket_path: &Path,
     request: &ResolveRequest,
@@ -73,6 +65,10 @@ pub fn request_resolution_detailed(
     Ok(success)
 }
 
+/// The client half of [`ResolvePurpose::Inspect`]. Intentional public surface
+/// with no in-tree caller: the daemon implements inspection (closure reports
+/// for prewarm/audit tooling), and this is the only supported way to speak that
+/// side of the protocol. Removing it would leave a server-only feature.
 pub fn request_inspection(
     socket_path: &Path,
     request: &ResolveRequest,
