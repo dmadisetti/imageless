@@ -13,14 +13,6 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub fn action_of(arguments: &[String]) -> &str {
-    arguments.last().map(String::as_str).unwrap_or("")
-}
-
-pub fn canonical_bundle() -> io::Result<PathBuf> {
-    std::fs::canonicalize(std::env::current_dir()?)
-}
-
 pub fn plan(
     annotations: &HashMap<String, String>,
     rootfs: &Path,

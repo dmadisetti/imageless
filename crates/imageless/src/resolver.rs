@@ -90,10 +90,14 @@ impl ResolverConfig {
                 .unwrap_or_else(|| {
                     PathBuf::from(option_env!("IMAGELESS_NIX_STORE").unwrap_or("nix-store"))
                 }),
+            // Fail-closed placeholder policy. Every caller replaces it with a
+            // loaded node policy (the daemon from `--policy-file`, in-process
+            // materialization from the policy file or inline JSON), so there is
+            // deliberately no environment switch that can loosen it here.
             policy: ResolverPolicy {
                 system: std::env::var("IMAGELESS_SYSTEM")
                     .unwrap_or_else(|_| "x86_64-linux".to_string()),
-                cache_only: std::env::var_os("IMAGELESS_DEVELOPMENT").is_none(),
+                cache_only: true,
                 eval_allowed_uri_prefixes: Vec::new(),
                 issuers: HashMap::new(),
             },
