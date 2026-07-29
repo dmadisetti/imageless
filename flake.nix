@@ -3,9 +3,14 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/8c3cede7ddc26bd659d2d383b5610efbd2c7a16e";
+    # Compatibility-matrix leg (ROADMAP v0.2): the last nixpkgs generation
+    # still carrying containerd 1.x. Used only for the containerd package in
+    # the 1.x CRI gate — everything else in that VM comes from the primary
+    # pin, so the gate isolates exactly one variable.
+    nixpkgs-containerd1.url = "github:nixos/nixpkgs/50ab793786d9de88ee30ec4e4c24fb4236fc2674";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, nixpkgs-containerd1 }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
@@ -170,6 +175,12 @@
             testScript = ''
               node.wait_for_unit("docker.service")
 
+              # Record the matrix cell in the gate log: conformance evidence
+              # is per-version (CONFORMANCE.md).
+              print("### MATRIX " + node.succeed(
+                  "docker --version && ${pkgs.runc}/bin/runc --version && nix --version"
+              ))
+
               # No daemon in this VM: the socket the daemon profile would use
               # must not exist, so a passing smoke proves the in-process path.
               node.fail("test -e /run/imageless/resolver.sock")
@@ -249,11 +260,14 @@
             releaseName = "cri";
             cache = "local";
           };
-          imageless-cri-smoke = pkgs.writeShellApplication {
+          # Parameterized over containerd so the in-guest ctr client always
+          # matches the node's daemon generation (a 2.x ctr against a 1.x
+          # daemon would test client skew, not the runtime contract).
+          mkCriSmoke = containerdPackage: pkgs.writeShellApplication {
             name = "imageless-cri-smoke";
             runtimeInputs = [
               pkgs.coreutils
-              pkgs.containerd
+              containerdPackage
               pkgs.cri-tools
               pkgs.findutils
               pkgs.gnugrep
@@ -276,16 +290,35 @@
               ${builtins.readFile ./smoke/imageless-cri-smoke.sh}
             '';
           };
+          imageless-cri-smoke = mkCriSmoke pkgs.containerd;
           # A real containerd/CRI node driven through the full lifecycle —
           # sandbox passthrough, per-container selection, recreate,
           # GC-while-running, delete-and-collect, reboot recovery — on BOTH
           # store-projection backends. This gate runs the resolver-daemon
           # profile, so CI covers both materializer modes (the Docker gate
           # above covers in-process).
-          imageless-cri-vm = pkgs.testers.runNixOSTest (
+          #
+          # Parameterized into a compatibility matrix (ROADMAP v0.2): each
+          # instance pins one containerd generation and carries the settings
+          # shape that generation expects, so a containerd change can never
+          # silently invalidate the conformance claim for the other one.
+          mkCriVm = { containerdPackage ? null, sandboxImageSettings, nameSuffix ? "" }:
+            pkgs.testers.runNixOSTest (
             let
+              criSmoke =
+                if containerdPackage == null
+                then imageless-cri-smoke
+                else mkCriSmoke containerdPackage;
               nodeBase = { ... }: {
                 imports = [ self.nixosModules.imageless ];
+                # The containerd NixOS module hardcodes pkgs.containerd
+                # (no package option), so a compatibility leg swaps the
+                # node's generation through an overlay; pkgsReadOnly is
+                # lifted below only for those legs, keeping the primary
+                # gate's eval on the shared pkgs.
+                nixpkgs.overlays = lib.mkIf (containerdPackage != null) [
+                  (_final: _prev: { containerd = containerdPackage; })
+                ];
                 services.imageless = {
                   enable = true;
                   resolver.enable = true;
@@ -312,12 +345,12 @@
                   };
                 };
 
-                # The VM is hermetic (no network). Point the pinned
-                # pod-sandbox ("pause") image at the locally-imported smoke
-                # image so RunPodSandbox resolves locally instead of pulling
-                # the containerd default from registry.k8s.io.
-                virtualisation.containerd.settings.plugins."io.containerd.cri.v1.images".pinned_images.sandbox =
-                  "localhost/imageless-smoke:phase0";
+                # The VM is hermetic (no network). Each matrix instance
+                # points the pod-sandbox ("pause") image at the
+                # locally-imported smoke image — through that generation's
+                # settings shape — so RunPodSandbox resolves locally instead
+                # of pulling the containerd default from registry.k8s.io.
+                virtualisation.containerd.settings = sandboxImageSettings;
 
                 # The smoke GCs the disposable rootfs and asserts the reboot
                 # reclaims it, then re-realises it in-guest. Three pieces keep
@@ -358,7 +391,7 @@
                 };
 
                 # `jq` for the projection-shape assertions in the testScript.
-                environment.systemPackages = [ imageless-cri-smoke pkgs.jq ];
+                environment.systemPackages = [ criSmoke pkgs.jq ];
 
                 # The retained witness workload (`sleep 600`, PID-ns init, so
                 # it ignores SIGTERM) would otherwise hold each reboot at the
@@ -367,7 +400,7 @@
               };
             in
             {
-              name = "imageless-cri-lifecycle";
+              name = "imageless-cri-lifecycle${nameSuffix}";
               nodes.node = nodeBase;
               nodes.closure = { ... }: {
                 imports = [ nodeBase ];
@@ -384,6 +417,13 @@
                 for machine in (node, closure):
                     machine.wait_for_unit("imageless-resolver.service")
                     machine.wait_for_unit("containerd.service")
+
+                # Record the matrix cell in the gate log: conformance
+                # evidence is per-version (CONFORMANCE.md), so the run must
+                # state what it actually exercised.
+                print("### MATRIX " + node.succeed(
+                    "containerd --version && nix --version"
+                ))
 
                 def rewritten_bundle(machine):
                     # The retained witness container from `pre-reboot` is
@@ -466,8 +506,29 @@
                 run_smoke(node, "post-reboot")
                 run_smoke(closure, "post-reboot")
               '';
+            } // lib.optionalAttrs (containerdPackage != null) {
+              # Only the overlay-carrying legs pay for their own nixpkgs
+              # evaluation; the primary instance keeps the shared read-only
+              # pkgs.
+              node.pkgsReadOnly = false;
             }
           );
+          imageless-cri-vm = mkCriVm {
+            # Primary pin: containerd 2.x straight from the flake's nixpkgs.
+            # 2.x reads its sandbox pin from the CRI image-service plugin
+            # table.
+            sandboxImageSettings.plugins."io.containerd.cri.v1.images".pinned_images.sandbox =
+              "localhost/imageless-smoke:phase0";
+          };
+          imageless-cri-vm-containerd1 = mkCriVm {
+            # Compatibility leg: containerd 1.x from the dedicated input.
+            # 1.x predates the split image-service plugin; its sandbox pin
+            # is `sandbox_image` on the monolithic CRI plugin.
+            containerdPackage = nixpkgs-containerd1.legacyPackages.${system}.containerd;
+            sandboxImageSettings.plugins."io.containerd.grpc.v1.cri".sandbox_image =
+              "localhost/imageless-smoke:phase0";
+            nameSuffix = "-containerd1";
+          };
 
           # Store-projection shape proof against completely stock runc: a
           # materialized-style rootfs whose binaries live in the node store
@@ -488,7 +549,7 @@
           inherit docker-embedded-seed docker-embedded-image docker-passthrough-image placeholder-image;
           inherit nginx-embedded-seed nginx-embedded-image;
           inherit docker-embedded-scenario;
-          inherit docker-embedded-smoke imageless-cri-vm;
+          inherit docker-embedded-smoke imageless-cri-vm imageless-cri-vm-containerd1;
           inherit smoke-image smoke-rootfs smoke-release imageless-cri-smoke;
           inherit cri-embedded-seed cri-embedded-image;
           inherit stock-oci-smoke;
@@ -498,7 +559,7 @@
       # `nix flake check` evaluates every derivation under `packages` and
       # `checks`. A NixOS VM test's qemu closure reads the .drv it seeds via
       # virtualisation.additionalPaths (smoke-rootfs) at EVAL time, which is not
-      # valid on a fresh store — so the two VM gates cannot live under either.
+      # valid on a fresh store — so the VM gates cannot live under either.
       # They go under legacyPackages, the one derivation-bearing output flake
       # check skips. `nix build .#imageless-cri-vm` still resolves them (the
       # installable lookup falls through packages -> legacyPackages), and the
@@ -507,10 +568,12 @@
         builtins.removeAttrs self.allPackages.${system} [
           "docker-embedded-smoke"
           "imageless-cri-vm"
+          "imageless-cri-vm-containerd1"
         ]);
 
       legacyPackages = forAllSystems (system: {
-        inherit (self.allPackages.${system}) docker-embedded-smoke imageless-cri-vm;
+        inherit (self.allPackages.${system})
+          docker-embedded-smoke imageless-cri-vm imageless-cri-vm-containerd1;
       });
 
       checks = forAllSystems (system:
