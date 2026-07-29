@@ -244,6 +244,34 @@
             copyToRoot = cri-embedded-seed;
             config.Cmd = [ "/bin/busybox" "sleep" "600" ];
           };
+          # External-reference source (SPEC §3): the same busybox rootfs shape
+          # as the embedded seed, but it reaches the node as
+          # `tarball+http://…?narHash=…` served by the smoke itself on guest
+          # loopback — present in NO image layer, which is exactly the mode
+          # under test. Single top-level directory, as the tarball fetcher
+          # expects; a distinct marker file keeps the assertion honest.
+          cri-external-src = pkgs.runCommand "imageless-cri-external-src" { } ''
+            root=$out/source/rootfs
+            mkdir -p $root/bin $root/dev/shm $root/etc $root/nix/store \
+              $root/proc $root/sys $root/tmp
+            cp ${pkgs.pkgsStatic.busybox}/bin/busybox $root/bin/busybox
+            printf 'imageless-cri-external-ok\n' > $root/etc/imageless-cri-external
+            printf 'root:x:0:0:root:/tmp:/bin/busybox\n' > $root/etc/passwd
+            printf 'root:x:0:\n' > $root/etc/group
+            touch $root/etc/hostname $root/etc/hosts $root/etc/resolv.conf
+            printf '%s\n' '{' \
+              '  outputs = { self }: {' \
+              '    rootfs = builtins.path {' \
+              '      path = ./rootfs;' \
+              '      name = "imageless-cri-external-rootfs";' \
+              '    };' \
+              '  };' \
+              '}' > $out/source/flake.nix
+          '';
+          cri-external-tarball = pkgs.runCommand "imageless-cri-external-tarball" { } ''
+            mkdir $out
+            tar -czf $out/flake.tar.gz -C ${cri-external-src} source
+          '';
           smoke-rootfs = pkgs.runCommand "imageless-smoke-rootfs" { } ''
             mkdir -p $out/bin $out/etc $out/tmp $out/nix/store $out/proc $out/sys \
               $out/dev/shm
@@ -288,6 +316,8 @@
               # store.
               export IMAGELESS_SMOKE_ROOTFS_DRV=${builtins.unsafeDiscardStringContext smoke-rootfs.drvPath}
               export IMAGELESS_SMOKE_RELEASE_REFERENCE=${smoke-release.reference}
+              export IMAGELESS_SMOKE_EXTERNAL_TARBALL=${cri-external-tarball}/flake.tar.gz
+              export IMAGELESS_SMOKE_HTTPD=${pkgs.pkgsStatic.busybox}/bin/busybox
               ${builtins.readFile ./smoke/imageless-cri-smoke.sh}
             '';
           };
@@ -330,9 +360,16 @@
                   # release-annotated workloads keep exercising the digest
                   # path against this same policy, and evaluation runs
                   # through the resolver's privilege-separated development
-                  # worker, which no other gate covers.
+                  # worker, which no other gate covers. The loopback tarball
+                  # prefix is the external-reference mode (SPEC.md §3): the
+                  # smoke serves the flake over guest-local HTTP, and any
+                  # OTHER external prefix stays un-listed so the smoke can
+                  # assert the deny path too.
                   policy.cacheOnly = false;
-                  policy.evalAllowedUriPrefixes = [ "path:" ];
+                  policy.evalAllowedUriPrefixes = [
+                    "path:"
+                    "tarball+http://127.0.0.1:8081/"
+                  ];
                   policy.issuers.imageless-smoke = {
                     source = {
                       kind = "local";
