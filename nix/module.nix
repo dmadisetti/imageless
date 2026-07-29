@@ -139,8 +139,16 @@ in
       evalAllowedUriPrefixes = mkOption {
         type = types.listOf types.str;
         default = [ ];
-        example = [ "path:" ];
-        description = "URI prefixes accepted for flake evaluation when cacheOnly is false.";
+        example = [ "path:" "github:yourorg/" ];
+        description = ''
+          URI prefixes accepted for flake evaluation when cacheOnly is false.
+          `path:` authorizes embedded flakes (the runtime's own rewrite of
+          staged in-image sources — never a node path named by an annotation);
+          a remote prefix such as `github:yourorg/` additionally authorizes
+          external flake references (SPEC.md §3). Matching is a literal string
+          prefix, so terminate entries at a boundary: `github:yourorg` would
+          also authorize `github:yourorg-evil/anything`.
+        '';
       };
       issuers = mkOption {
         type = types.attrsOf issuerType;
