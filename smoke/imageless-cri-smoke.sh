@@ -30,7 +30,10 @@ import_artifacts() {
   local sandbox_image
   sandbox_image=$("${CRICTL[@]}" info | jq -r 'first(.. | objects | .sandboxImage? // empty)')
   if [[ -n $sandbox_image ]] && ! ctr --address "$CTR_ADDRESS" --namespace k8s.io images list --quiet | grep -Fxq "$sandbox_image"; then
-    ctr --address "$CTR_ADDRESS" --namespace k8s.io images tag "$LOCAL_IMAGE" "$sandbox_image" >/dev/null
+    # --force keeps this idempotent: after a reboot the tag survives in the
+    # image store, and the list-based guard above can race the import that
+    # just recreated it (containerd 1.7 refuses to overwrite without force).
+    ctr --address "$CTR_ADDRESS" --namespace k8s.io images tag --force "$LOCAL_IMAGE" "$sandbox_image" >/dev/null
   fi
 }
 
