@@ -43,7 +43,7 @@ pub use release::{
 #[cfg(feature = "daemon")]
 pub use resolver::{handle_connection, serve, DevelopmentWorkerConfig, Resolver, ResolverConfig};
 pub use resolver::{load_resolver_policy, resolve_in_process, PolicySource, DEFAULT_POLICY_PATH};
-pub use spec::{expansion_request, plan, validate_store_path};
+pub use spec::{expansion_request, plan, validate_source, validate_store_path};
 
 /// Compiles every Rust block in the repository README as a doc-test, so the
 /// embedding example in the front door cannot drift from this API. Not part of
