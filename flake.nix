@@ -203,6 +203,36 @@
             };
             config.Cmd = [ "/bin/sleep" "600" ];
           };
+          # CRI variant of the embedded-layer seed: the image layer carries
+          # ONLY the flake and its source inputs — no top-level /bin — so the
+          # workload can only run if the rootfs was materialized from the
+          # flake. Unlike the Docker seed, the source rootfs pre-creates the
+          # mountpoints CRI binds over a read-only root (hostname, hosts,
+          # resolv.conf, /dev/shm).
+          cri-embedded-seed = pkgs.runCommand "imageless-cri-embedded-seed" { } ''
+            root=$out/etc/imageless/rootfs
+            mkdir -p $root/bin $root/dev/shm $root/etc $root/nix/store \
+              $root/proc $root/sys $root/tmp
+            cp ${pkgs.pkgsStatic.busybox}/bin/busybox $root/bin/busybox
+            printf 'imageless-cri-embedded-ok\n' > $root/etc/imageless-cri-embedded
+            printf 'root:x:0:0:root:/tmp:/bin/busybox\n' > $root/etc/passwd
+            printf 'root:x:0:\n' > $root/etc/group
+            touch $root/etc/hostname $root/etc/hosts $root/etc/resolv.conf
+            printf '%s\n' '{' \
+              '  outputs = { self }: {' \
+              '    rootfs = builtins.path {' \
+              '      path = ./rootfs;' \
+              '      name = "imageless-cri-embedded-rootfs";' \
+              '    };' \
+              '  };' \
+              '}' > $out/etc/imageless/flake.nix
+          '';
+          cri-embedded-image = pkgs.dockerTools.buildImage {
+            name = "localhost/imageless-cri-embedded";
+            tag = "phase0";
+            copyToRoot = cri-embedded-seed;
+            config.Cmd = [ "/bin/busybox" "sleep" "600" ];
+          };
           smoke-rootfs = pkgs.runCommand "imageless-smoke-rootfs" { } ''
             mkdir -p $out/bin $out/etc $out/tmp $out/nix/store $out/proc $out/sys \
               $out/dev/shm
@@ -233,6 +263,7 @@
             ];
             text = ''
               export IMAGELESS_SMOKE_IMAGE_ARCHIVE=${smoke-image}
+              export IMAGELESS_SMOKE_EMBEDDED_IMAGE_ARCHIVE=${cri-embedded-image}
               # A bare path string, context discarded on purpose: this only
               # names the .drv the smoke realizes in-guest. The .drv (and its
               # input closure) is seeded and GC-rooted in the guest store by
@@ -258,6 +289,16 @@
                 services.imageless = {
                   enable = true;
                   resolver.enable = true;
+                  # The gate must prove embedded-layer bootstrap — a flake
+                  # present only in the image layer selecting and
+                  # materializing — and that is node-side evaluation, opted
+                  # into exactly as a deployment would (SPEC.md §2.1). The
+                  # release-annotated workloads keep exercising the digest
+                  # path against this same policy, and evaluation runs
+                  # through the resolver's privilege-separated development
+                  # worker, which no other gate covers.
+                  policy.cacheOnly = false;
+                  policy.evalAllowedUriPrefixes = [ "path:" ];
                   policy.issuers.imageless-smoke = {
                     source = {
                       kind = "local";
@@ -449,6 +490,7 @@
           inherit docker-embedded-scenario;
           inherit docker-embedded-smoke imageless-cri-vm;
           inherit smoke-image smoke-rootfs smoke-release imageless-cri-smoke;
+          inherit cri-embedded-seed cri-embedded-image;
           inherit stock-oci-smoke;
           default = imageless-runc;
         });
