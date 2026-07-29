@@ -42,6 +42,11 @@ rustPlatform.buildRustPackage {
   IMAGELESS_DEV_PATH = lib.makeBinPath [ nix gitMinimal ];
   IMAGELESS_DEV_SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
 
+  # The exact Nix the baked IMAGELESS_NIX drives, exposed so harnesses that
+  # import this package's closure onto a node (dev/kind/setup.sh) can invoke
+  # the node's own nix by its store path.
+  passthru.materializerNix = nix;
+
   meta = {
     description = "Materialize a Nix flake carried in OCI image layers into the container rootfs at create time";
     homepage = "https://imageless.run";
