@@ -14,12 +14,14 @@ STATE_DIR=${IMAGELESS_SMOKE_STATE_DIR:-/var/lib/imageless-cri-smoke}
 ENDPOINT=${CONTAINER_RUNTIME_ENDPOINT:-unix:///run/containerd/containerd.sock}
 HANDLER=${IMAGELESS_RUNTIME_HANDLER:-imageless}
 LOCAL_IMAGE=localhost/imageless-smoke:phase0
+EMBEDDED_IMAGE=localhost/imageless-cri-embedded:phase0
 CTR_ADDRESS=${ENDPOINT#unix://}
 CRICTL=(crictl --runtime-endpoint "$ENDPOINT" --image-endpoint "$ENDPOINT")
 mkdir -p "$STATE_DIR"
 
 import_artifacts() {
   ctr --address "$CTR_ADDRESS" --namespace k8s.io images import "$IMAGELESS_SMOKE_IMAGE_ARCHIVE" >/dev/null
+  ctr --address "$CTR_ADDRESS" --namespace k8s.io images import "$IMAGELESS_SMOKE_EMBEDDED_IMAGE_ARCHIVE" >/dev/null
   local sandbox_image
   sandbox_image=$("${CRICTL[@]}" info | jq -r 'first(.. | objects | .sandboxImage? // empty)')
   if [[ -n $sandbox_image ]] && ! ctr --address "$CTR_ADDRESS" --namespace k8s.io images list --quiet | grep -Fxq "$sandbox_image"; then
@@ -94,6 +96,51 @@ fresh_selected_workload() {
   rm -rf "$work"
 }
 
+# Embedded-layer bootstrap (SPEC.md §2.1 under CRI): a pod with NO imageless
+# annotations whose container image carries etc/imageless/flake.nix — and no
+# top-level /bin — in its layer. The flake alone must select the container,
+# and the workload can only run out of the materialized rootfs.
+embedded_bootstrap() {
+  local label=$1
+  local work pod main state root_link target
+  work=$(mktemp -d)
+  jq -n \
+    --arg name "imageless-embedded-$label" --arg uid "imageless-embedded-$label-$(date +%s%N)" \
+    '{metadata:{name:$name,namespace:"imageless-smoke",uid:$uid,attempt:1},
+      linux:{security_context:{namespace_options:{network:2,pid:1,ipc:1}}}}' >"$work/pod.json"
+  jq -n \
+    --arg name embedded --arg image "$EMBEDDED_IMAGE" \
+    '{metadata:{name:$name,attempt:1},image:{image:$image},
+      command:["/bin/busybox","sleep","600"],
+      annotations:{"io.kubernetes.cri.container-type":"container","io.kubernetes.cri.container-name":$name},
+      linux:{security_context:{readonly_rootfs:true}}}' >"$work/main.json"
+  pod=$("${CRICTL[@]}" runp --runtime "$HANDLER" "$work/pod.json")
+  main=$("${CRICTL[@]}" create --no-pull "$pod" "$work/main.json" "$work/pod.json")
+  "${CRICTL[@]}" start "$main" >/dev/null
+  # A passthrough bundle would have no /bin/busybox and exit on the exec
+  # (asynchronously on newer containerd — settle before inspecting).
+  sleep 1
+  state=$("${CRICTL[@]}" inspect --output json "$main" | jq -r '.status.state')
+  [[ $state == CONTAINER_RUNNING ]] || {
+    echo "embedded workload is not running (state: $state)" >&2
+    return 1
+  }
+  root_link=$(root_for_container "$main")
+  [[ -L $root_link ]] || { echo "embedded workload has no bundle GC root" >&2; return 1; }
+  target=$(readlink "$root_link")
+  [[ $target == /nix/store/* && $target != "$ROOTFS" ]] || {
+    echo "embedded rootfs resolved to an unexpected path: $target" >&2
+    return 1
+  }
+  [[ -f $target/etc/imageless-cri-embedded ]] || {
+    echo "materialized root is missing the embedded marker" >&2
+    return 1
+  }
+  cleanup_container "$main"
+  cleanup_pod "$pod"
+  rm -rf "$work"
+}
+
 import_artifacts
 
 if [[ $MODE == post-reboot ]]; then
@@ -113,6 +160,7 @@ if [[ $MODE == post-reboot ]]; then
   [[ ! -e $OLD_ROOTFS ]] || { echo "GC retained disposable old rootfs: $OLD_ROOTFS" >&2; exit 1; }
   make_rootfs
   fresh_selected_workload post-reboot
+  embedded_bootstrap post-reboot
   rm -f "$STATE_DIR"/old-rootfs "$STATE_DIR"/old-root-link "$STATE_DIR"/old-pod "$STATE_DIR"/old-container
   echo "post-reboot imageless CRI smoke passed"
   exit 0
@@ -193,6 +241,10 @@ cleanup_container "$SIDECAR"; SIDECAR=''
 cleanup_pod "$POD"; POD=''
 trap - EXIT
 rm -rf "$WORK"
+
+# Embedded bootstrap runs before the reboot witness so the witness bundle is
+# the only GC-root-carrying bundle left when the driver asserts mount shapes.
+embedded_bootstrap pre-reboot
 
 fresh_selected_workload pre-reboot yes
 echo "pre-reboot imageless CRI smoke passed; reboot the node, then run: imageless-cri-smoke post-reboot"
