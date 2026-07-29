@@ -20,8 +20,13 @@ CRICTL=(crictl --runtime-endpoint "$ENDPOINT" --image-endpoint "$ENDPOINT")
 mkdir -p "$STATE_DIR"
 
 import_artifacts() {
-  ctr --address "$CTR_ADDRESS" --namespace k8s.io images import "$IMAGELESS_SMOKE_IMAGE_ARCHIVE" >/dev/null
-  ctr --address "$CTR_ADDRESS" --namespace k8s.io images import "$IMAGELESS_SMOKE_EMBEDDED_IMAGE_ARCHIVE" >/dev/null
+  # dockerTools emits gzipped archives, and `ctr images import` learned
+  # transparent decompression only in containerd 2.x — feed every
+  # generation a plain tar (zcat -f passes uncompressed data through).
+  zcat -f "$IMAGELESS_SMOKE_IMAGE_ARCHIVE" \
+    | ctr --address "$CTR_ADDRESS" --namespace k8s.io images import - >/dev/null
+  zcat -f "$IMAGELESS_SMOKE_EMBEDDED_IMAGE_ARCHIVE" \
+    | ctr --address "$CTR_ADDRESS" --namespace k8s.io images import - >/dev/null
   local sandbox_image
   sandbox_image=$("${CRICTL[@]}" info | jq -r 'first(.. | objects | .sandboxImage? // empty)')
   if [[ -n $sandbox_image ]] && ! ctr --address "$CTR_ADDRESS" --namespace k8s.io images list --quiet | grep -Fxq "$sandbox_image"; then
