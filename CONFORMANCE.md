@@ -26,15 +26,24 @@ someone ran for its own sake. A gate run does not qualify, however realistic.
 
 ## Gate runs
 
-The matrix cell is a single column until the compatibility matrix lands in
-CI (ROADMAP v0.2); after that, one row per consumer x gate x cell.
+One row per consumer x gate x matrix cell. Every VM gate prints a
+`### MATRIX` line stating the versions it actually exercised, so a linked run
+is self-describing; the rootless stock-runc smoke runs in the `build` job of
+the same workflow.
 
 | Consumer | Gate | Matrix cell | Commit | Date | Evidence | Freeze |
 |---|---|---|---|---|---|---|
-| imageless-runc | docker-embedded-smoke | containerd 2.3.1 / Docker 29.5.2 / runc 1.4.2 | 3abc69f (merged as 1335c5b) | 2026-07-29 | <https://github.com/dmadisetti/imageless/actions/runs/30428954833> | required |
-| imageless-runc | imageless-cri-vm | containerd 2.3.1 / Docker 29.5.2 / runc 1.4.2 | 3abc69f (merged as 1335c5b) | 2026-07-29 | <https://github.com/dmadisetti/imageless/actions/runs/30428954833> | required |
+| imageless-runc | docker-embedded-smoke | Docker 29.5.2 / runc 1.4.2 (OCI spec 1.3.0) | 29a0969 | 2026-07-29 | <https://github.com/dmadisetti/imageless/actions/runs/30438374380> | required |
+| imageless-runc | imageless-cri-vm | containerd 2.3.1 / runc 1.4.2 / nix 2.34.7 | 29a0969 | 2026-07-29 | <https://github.com/dmadisetti/imageless/actions/runs/30438374380> | required |
+| imageless-runc | imageless-cri-vm-containerd1 | containerd 1.7.23 / runc 1.4.2 / nix 2.34.7 | 29a0969 | 2026-07-29 | <https://github.com/dmadisetti/imageless/actions/runs/30438374380> | required |
+| imageless-runc | stock-oci-smoke (rootless) | runc 1.4.2, unprivileged runner user | 29a0969 | 2026-07-29 | <https://github.com/dmadisetti/imageless/actions/runs/30438374380> | required |
 | cowboy-runtime | docker-embedded-smoke | — | — | — | pending (needs the consumer-pluggable gate harness) | required |
 | cowboy-runtime | imageless-cri-vm | — | — | — | pending (needs the consumer-pluggable gate harness) | required |
+
+Superseded rows (first-ever green, pre-matrix): docker-embedded-smoke and
+imageless-cri-vm at 3abc69f (merged as 1335c5b), single cell
+"containerd 2.3.1 / Docker 29.5.2 / runc 1.4.2",
+<https://github.com/dmadisetti/imageless/actions/runs/30428954833>.
 
 ## Deployment attestations
 

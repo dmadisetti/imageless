@@ -39,7 +39,7 @@ of arriving alongside the core the way they did in the incubation repo.
       (`cache_only: false`) wherever embedded flakes are the point; the shipped
       default stays fail-closed (`cache_only: true`). Document pinning
       expectations — a mutable ref is not a deployment identity.
-- [ ] **Compatibility matrix in CI.** The CRI gate against pinned containerd
+- [x] **Compatibility matrix in CI.** The CRI gate against pinned containerd
       1.x and 2.x, the Docker smoke against a pinned Docker, plus rootless
       stock-runc — recorded per version so a containerd change cannot silently
       invalidate the claim.
