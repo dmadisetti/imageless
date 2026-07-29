@@ -1,0 +1,29 @@
+# A kind cluster whose node carries the imageless containerd runtime entry.
+#
+# Requires kind >= 0.27: those nodes ship containerd 2.x (config version 3),
+# where the CRI runtime table is plugins.'io.containerd.cri.v1.runtime'. A
+# grpc.v1.cri-shaped patch (the containerd 1.x table, see
+# examples/containerd-config-v2.toml) merged into a version-3 config is
+# silently dead.
+#
+# The patch mirrors the runtime body of examples/containerd-config.toml and
+# is applied at node CREATION — changing it means recreating the cluster.
+# The shim binary, node store, and policy land afterwards via setup.sh,
+# deliberately not as extraMounts: a bind-mounted policy file would be
+# host-uid-owned (the runtime's ownership check fails closed on it), and a
+# bind of the host /nix would silently void the GC-root guarantee (root
+# symlink targets would resolve in the wrong mount namespace).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: imageless
+containerdConfigPatches:
+  - |-
+    [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.imageless]
+      runtime_type = "io.containerd.runc.v2"
+      pod_annotations = ["imageless.run/*"]
+      container_annotations = ["imageless.run/*"]
+      [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.imageless.options]
+        BinaryName = "/usr/local/bin/imageless-runc"
+        SystemdCgroup = true
+nodes:
+  - role: control-plane

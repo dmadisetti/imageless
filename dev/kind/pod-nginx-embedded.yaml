@@ -1,0 +1,28 @@
+# The quickstart's demo pod: zero-config embedded discovery. No imageless
+# annotations anywhere — the ~2 KB image carries etc/imageless/flake.nix, and
+# that file alone selects the container. The RuntimeClass comes from
+# examples/runtimeclass.yaml; the node policy is examples/dev-policy.json,
+# installed by setup.sh.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: imageless-nginx
+spec:
+  runtimeClassName: imageless
+  restartPolicy: Never
+  containers:
+    - name: nginx
+      image: localhost/imageless-nginx-embedded:e2e
+      # Loaded by `kind load image-archive`; the node must never try to pull
+      # this digest from a registry.
+      imagePullPolicy: Never
+      ports:
+        - containerPort: 18080
+      # nginx-embedded's conf points pid/temp paths at /tmp: the materialized
+      # root is read-only, so the pod supplies the writable directory.
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}
