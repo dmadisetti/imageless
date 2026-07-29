@@ -278,25 +278,31 @@
                 virtualisation.containerd.settings.plugins."io.containerd.cri.v1.images".pinned_images.sandbox =
                   "localhost/imageless-smoke:phase0";
 
-                # The smoke realises and GCs the disposable rootfs INSIDE the
-                # guest and asserts GC reclaims it after reboot. Two things
-                # keep that honest:
+                # The smoke GCs the disposable rootfs and asserts the reboot
+                # reclaims it, then re-realises it in-guest. Three pieces keep
+                # that honest, and each is load-bearing:
+                #
+                #  * additionalPaths seeds the rootfs .drv — and, because
+                #    closure-info runs exportReferencesGraph over it, the
+                #    OUTPUT path too — into the guest store and its boot-time
+                #    registration. The output must be seeded wherever it is
+                #    registered: registration alone leaves a valid-but-absent
+                #    path that `nix-store --realise` happily no-ops on, and
+                #    runc then delegates onto a rootfs that does not exist.
                 #
                 #  * The rebuild inputs — the .drv closure and every
-                #    build-time output (inputDerivation) — are rooted through
-                #    the SYSTEM closure. `virtualisation.additionalPaths` only
-                #    registers paths in the guest Nix database without rooting
-                #    them, and the smoke runs `nix-store --gc` itself (post-
-                #    reboot it does so BEFORE re-realising the rootfs), so
-                #    anything unrooted is collected and the rebuild degrades
-                #    into an offline world-rebuild that dies on the first
-                #    fetch. Only the rootfs OUTPUT stays unrooted: that is the
-                #    disposable path whose collection the gate asserts.
+                #    build-time output (inputDerivation) — are ALSO rooted
+                #    through the system closure. additionalPaths registers
+                #    without rooting, the smoke runs `nix-store --gc` itself
+                #    (post-reboot BEFORE re-realising), and anything unrooted
+                #    is collected, degrading the rebuild into an offline
+                #    world-rebuild that dies on the first fetch. Only the
+                #    rootfs OUTPUT stays unrooted: that is the disposable
+                #    path whose collection the gate asserts.
                 #
                 #  * The writable store lives on the VM disk, not the default
-                #    tmpfs upper layer. On tmpfs the pre-reboot rootfs would
-                #    vanish with the reboot itself and the "GC reclaims it
-                #    after reboot" assertion would pass vacuously.
+                #    tmpfs upper layer, so what the post-reboot GC acts on is
+                #    state that genuinely survived the reboot.
                 system.extraDependencies = [
                   smoke-rootfs.drvPath
                   smoke-rootfs.inputDerivation
@@ -307,6 +313,7 @@
                   memorySize = 4096;
                   cores = 2;
                   diskSize = 8192;
+                  additionalPaths = [ smoke-rootfs.drvPath ];
                 };
 
                 # `jq` for the projection-shape assertions in the testScript.
