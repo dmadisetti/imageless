@@ -149,6 +149,146 @@ embedded_bootstrap() {
   rm -rf "$work"
 }
 
+# External flake reference (SPEC §3): the same evaluation opt-in as embedded
+# bootstrap, but the flake reaches the node over a remote transport instead of
+# an image layer. The VM is hermetic, so the smoke serves the tarball itself on
+# guest loopback — the only network the reference needs is one the gate
+# controls. The positive case runs a pinned (?narHash=) reference through the
+# resolver; the negative cases prove both deny paths: a remote prefix the
+# policy never allow-listed, and a node-local scheme rejected before policy.
+external_reference() {
+  local label=$1
+  local work pod main state root_link target narhash source httpd_pid=''
+  work=$(mktemp -d)
+  cp "$IMAGELESS_SMOKE_EXTERNAL_TARBALL" "$work/flake.tar.gz"
+  "$IMAGELESS_SMOKE_HTTPD" httpd -f -p 127.0.0.1:8081 -h "$work" &
+  httpd_pid=$!
+  # shellcheck disable=SC2064
+  trap "kill $httpd_pid 2>/dev/null || true" RETURN
+  narhash=''
+  for _ in $(seq 1 20); do
+    narhash=$(nix --extra-experimental-features 'nix-command flakes' \
+      flake metadata --json "tarball+http://127.0.0.1:8081/flake.tar.gz" \
+      2>/dev/null | jq -r '.locked.narHash // empty') && [[ -n $narhash ]] && break
+    sleep 0.25
+  done
+  [[ -n $narhash ]] || { echo "could not fetch the loopback flake tarball" >&2; return 1; }
+  source="tarball+http://127.0.0.1:8081/flake.tar.gz?narHash=$narhash"
+
+  jq -n \
+    --arg name "imageless-external-$label" --arg uid "imageless-external-$label-$(date +%s%N)" \
+    --arg source "$source" \
+    '{metadata:{name:$name,namespace:"imageless-smoke",uid:$uid,attempt:1},
+      annotations:{"run.imageless.source":$source,"run.imageless.containers":"external"},
+      linux:{security_context:{namespace_options:{network:2,pid:1,ipc:1}}}}' >"$work/pod.json"
+  jq -n \
+    --arg name external --arg image "$LOCAL_IMAGE" --arg source "$source" \
+    '{metadata:{name:$name,attempt:1},image:{image:$image},
+      command:["/bin/busybox","sleep","600"],
+      annotations:{"run.imageless.source":$source,"run.imageless.containers":"external",
+        "io.kubernetes.cri.container-type":"container","io.kubernetes.cri.container-name":$name},
+      linux:{security_context:{readonly_rootfs:true}}}' >"$work/main.json"
+  pod=$("${CRICTL[@]}" runp --runtime "$HANDLER" "$work/pod.json")
+  main=$("${CRICTL[@]}" create --no-pull "$pod" "$work/main.json" "$work/pod.json")
+  "${CRICTL[@]}" start "$main" >/dev/null
+  sleep 1
+  state=$("${CRICTL[@]}" inspect --output json "$main" | jq -r '.status.state')
+  [[ $state == CONTAINER_RUNNING ]] || {
+    echo "external-reference workload is not running (state: $state)" >&2
+    return 1
+  }
+  root_link=$(root_for_container "$main")
+  [[ -L $root_link ]] || { echo "external-reference workload has no bundle GC root" >&2; return 1; }
+  target=$(readlink "$root_link")
+  [[ $target == /nix/store/* && $target != "$ROOTFS" ]] || {
+    echo "external rootfs resolved to an unexpected path: $target" >&2
+    return 1
+  }
+  [[ -f $target/etc/imageless-cri-external ]] || {
+    echo "materialized root is missing the external marker" >&2
+    return 1
+  }
+  cleanup_container "$main"
+  cleanup_pod "$pod"
+
+  # Deny paths. CRI's CreateContainer only records metadata — the shim (and
+  # with it the planner and the resolver) runs at task-create, i.e. during
+  # `crictl start` (StartContainer -> shim Create -> runc create), identically
+  # on both containerd generations. A resolution failure fails that Create RPC
+  # synchronously, so `create` succeeds and `start` is the step that must err —
+  # unlike the failed-exec workload below, whose error is post-fifo and async.
+  local cursor denied
+  cursor=$(journalctl -u imageless-resolver -n0 --show-cursor --no-pager 2>/dev/null \
+    | sed -n 's/^-- cursor: //p' || true)
+  resolver_journal() {
+    if [[ -n $cursor ]]; then
+      journalctl -u imageless-resolver --after-cursor "$cursor" --no-pager 2>/dev/null
+    else
+      journalctl -u imageless-resolver --no-pager 2>/dev/null
+    fi
+  }
+
+  # Deny path 1: a remote-scheme reference whose prefix the node never
+  # allow-listed must fail task-create (PolicyDenied at the resolver).
+  jq -n \
+    --arg name "imageless-denied-$label" --arg uid "imageless-denied-$label-$(date +%s%N)" \
+    '{metadata:{name:$name,namespace:"imageless-smoke",uid:$uid,attempt:1},
+      annotations:{"run.imageless.source":"github:imageless-smoke/denied",
+        "run.imageless.containers":"denied"},
+      linux:{security_context:{namespace_options:{network:2,pid:1,ipc:1}}}}' >"$work/denied-pod.json"
+  jq -n \
+    --arg name denied --arg image "$LOCAL_IMAGE" \
+    '{metadata:{name:$name,attempt:1},image:{image:$image},
+      command:["/bin/busybox","sleep","600"],
+      annotations:{"run.imageless.source":"github:imageless-smoke/denied",
+        "run.imageless.containers":"denied",
+        "io.kubernetes.cri.container-type":"container","io.kubernetes.cri.container-name":$name},
+      linux:{security_context:{readonly_rootfs:true}}}' >"$work/denied.json"
+  pod=$("${CRICTL[@]}" runp --runtime "$HANDLER" "$work/denied-pod.json")
+  denied=$("${CRICTL[@]}" create --no-pull "$pod" "$work/denied.json" "$work/denied-pod.json")
+  if "${CRICTL[@]}" start "$denied" >/dev/null 2>&1; then
+    echo "starting a workload with a non-allow-listed external reference must fail" >&2
+    return 1
+  fi
+  for _ in $(seq 1 40); do
+    resolver_journal | grep -q "not authorized by node policy" && break
+    sleep 0.25
+  done
+  resolver_journal | grep -q "not authorized by node policy" || {
+    echo "resolver journal never recorded the policy denial" >&2
+    return 1
+  }
+  cleanup_container "$denied"
+  cleanup_pod "$pod"
+
+  # Deny path 2: a node-local scheme is rejected in the shim's planner, before
+  # any resolver is consulted (SPEC §3 — the in-image `/` form is the only way
+  # an annotation names node-local content). Same seam: task-create.
+  jq -n \
+    --arg name "imageless-local-$label" --arg uid "imageless-local-$label-$(date +%s%N)" \
+    '{metadata:{name:$name,namespace:"imageless-smoke",uid:$uid,attempt:1},
+      annotations:{"run.imageless.source":"file:///etc",
+        "run.imageless.containers":"local"},
+      linux:{security_context:{namespace_options:{network:2,pid:1,ipc:1}}}}' >"$work/local-pod.json"
+  jq -n \
+    --arg name local --arg image "$LOCAL_IMAGE" \
+    '{metadata:{name:$name,attempt:1},image:{image:$image},
+      command:["/bin/busybox","sleep","600"],
+      annotations:{"run.imageless.source":"file:///etc",
+        "run.imageless.containers":"local",
+        "io.kubernetes.cri.container-type":"container","io.kubernetes.cri.container-name":$name},
+      linux:{security_context:{readonly_rootfs:true}}}' >"$work/local.json"
+  pod=$("${CRICTL[@]}" runp --runtime "$HANDLER" "$work/local-pod.json")
+  denied=$("${CRICTL[@]}" create --no-pull "$pod" "$work/local.json" "$work/local-pod.json")
+  if "${CRICTL[@]}" start "$denied" >/dev/null 2>&1; then
+    echo "starting a workload with a node-local scheme must fail" >&2
+    return 1
+  fi
+  cleanup_container "$denied"
+  cleanup_pod "$pod"
+  rm -rf "$work"
+}
+
 import_artifacts
 
 if [[ $MODE == post-reboot ]]; then
@@ -253,6 +393,10 @@ rm -rf "$WORK"
 # Embedded bootstrap runs before the reboot witness so the witness bundle is
 # the only GC-root-carrying bundle left when the driver asserts mount shapes.
 embedded_bootstrap pre-reboot
+
+# External references likewise leave no bundle behind: the phase tears its
+# workloads down (deny-path pods included) before the witness is created.
+external_reference pre-reboot
 
 fresh_selected_workload pre-reboot yes
 echo "pre-reboot imageless CRI smoke passed; reboot the node, then run: imageless-cri-smoke post-reboot"
