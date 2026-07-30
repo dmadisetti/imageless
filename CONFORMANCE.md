@@ -38,12 +38,20 @@ freeze criteria additionally require below.
 
 | Consumer | Gate | Matrix cell | Commit | Date | Evidence | Freeze |
 |---|---|---|---|---|---|---|
-| imageless-runc | docker-embedded-smoke | Docker 29.5.2 / runc 1.4.2 (OCI spec 1.3.0) | 29a0969 | 2026-07-29 | <https://github.com/dmadisetti/imageless/actions/runs/30438374380> | required |
-| imageless-runc | imageless-cri-vm | containerd 2.3.1 / runc 1.4.2 / nix 2.34.7 | 29a0969 | 2026-07-29 | <https://github.com/dmadisetti/imageless/actions/runs/30438374380> | required |
-| imageless-runc | imageless-cri-vm-containerd1 | containerd 1.7.23 / runc 1.4.2 / nix 2.34.7 | 29a0969 | 2026-07-29 | <https://github.com/dmadisetti/imageless/actions/runs/30438374380> | required |
-| imageless-runc | stock-oci-smoke (rootless) | runc 1.4.2, unprivileged runner user | 29a0969 | 2026-07-29 | <https://github.com/dmadisetti/imageless/actions/runs/30438374380> | required |
+| imageless-runc | docker-embedded-smoke | Docker 29.5.2 / runc 1.4.2 (OCI spec 1.3.0) | a27648c | 2026-07-30 | <https://github.com/dmadisetti/imageless/actions/runs/30517123472> | required |
+| imageless-runc | imageless-cri-vm | containerd 2.3.1 / runc 1.4.2 / nix 2.34.7 | a27648c | 2026-07-30 | <https://github.com/dmadisetti/imageless/actions/runs/30517123472> | required |
+| imageless-runc | imageless-cri-vm-containerd1 | containerd 1.7.23 / runc 1.4.2 / nix 2.34.7 | a27648c | 2026-07-30 | <https://github.com/dmadisetti/imageless/actions/runs/30517123472> | required |
+| imageless-runc | stock-oci-smoke (rootless) | runc 1.4.2, unprivileged runner user | a27648c | 2026-07-30 | <https://github.com/dmadisetti/imageless/actions/runs/30517123472> | required |
 | cowboy-runtime | docker-embedded-smoke | — | — | — | pending (needs the consumer-pluggable gate harness) | required |
 | cowboy-runtime | imageless-cri-vm | — | — | — | pending (needs the consumer-pluggable gate harness) | required |
+
+Rows are refreshed to the newest green run on `main` that covers the cell, so
+the linked evidence keeps pace with what the gates assert; a row is never
+carried forward on an older run's authority after the gate itself has grown.
+The rows above moved from 29a0969
+(<https://github.com/dmadisetti/imageless/actions/runs/30438374380>, the
+first matrix run) precisely for that reason: that run predates the external
+reference phase the paragraph above now claims.
 
 Superseded rows (first-ever green, pre-matrix): docker-embedded-smoke and
 imageless-cri-vm at 3abc69f (merged as 1335c5b), single cell
