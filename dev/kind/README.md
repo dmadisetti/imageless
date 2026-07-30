@@ -50,6 +50,21 @@ resolve, and the guarantee would fail silently.
 Add `--prewarm` to pre-realize the nginx rootfs on the node (adds 1–2 min
 here, and the first pod then starts in seconds instead of minutes).
 
+To check the cluster-visible half of that wiring before going further:
+
+```sh
+nix build .#kubectl-imageless
+kubectl apply -f examples/runtimeclass.yaml
+./result/bin/kubectl-imageless doctor --context kind-imageless
+```
+
+Expected: `pass` on `runtime-class`, `scheduling`, and `nodes` (`1 of 1
+nodes`). A failure here is the cheap version of the failure you would
+otherwise meet as a pod stuck Pending in step 4. What `doctor` cannot see is
+the node-local half this step just installed — the containerd handler, the
+shim binary, the policy file have no API representation — so it reports
+`node-config` as a permanent skip and says as much. Step 4 remains the proof.
+
 ## 3. Load the seed image
 
 ```sh
@@ -122,6 +137,27 @@ by tag. Two caveats worth knowing before pointing this at a shared registry:
   reference stays digest-pinned either way.
 - `--dry-run` prints the same digests and pod manifest and touches no
   network, which is the way to inspect what would be pushed.
+
+`kubectl imageless run --external <flake-ref>` deploys a flake reference
+instead of packing anything — and **this cluster will not run it.** Two
+things stand in the way, both deliberate:
+
+- `kind-config.yaml` allow-lists `imageless.run/*` annotations only, so
+  containerd filters `run.imageless.source` out of the OCI spec and the shim
+  never sees it. The placeholder image the plugin pushes exists precisely to
+  make that visible: its flake throws, and the create fails saying the
+  annotation was dropped rather than starting some unrelated container.
+- `examples/dev-policy.json` allow-lists the `path:` prefix — enough for the
+  embedded flake this harness demonstrates, and nothing else.
+
+To try it anyway: add `"run.imageless.*"` to both annotation lists in
+`kind-config.yaml` (which means recreating the cluster — there is no
+reconciliation), and install `examples/external-refs-policy.json` with your
+own prefix in place of `github:yourorg/` instead of `dev-policy.json`. The
+node then fetches and builds what the pod names, which is a materially
+larger trust surface than an image you pushed; `--dry-run` and
+`kubectl imageless doctor --policy … --source …` both tell you whether the
+reference would be admitted before you find out from a stuck pod.
 
 ## Cleanup, GC, and re-runs
 

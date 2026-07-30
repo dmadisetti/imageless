@@ -140,6 +140,67 @@ registries garbage-collect untagged manifests (GHCR, ECR lifecycle policies) —
 `--tag` adds a tag to protect the push while the pod reference stays
 digest-pinned.
 
+`--external` deploys a flake *reference* instead, for nodes whose policy
+enables it:
+
+```bash
+kubectl imageless run --external \
+  github:myorg/agent/0123456789abcdef0123456789abcdef01234567 \
+  --repo registry.example/team/placeholder \
+  -- /bin/agent | kubectl apply -f -
+```
+
+Nothing is packed and nothing is evaluated on the client; the pod carries
+`run.imageless.source` and the node fetches and builds it under its own policy.
+Kubernetes still needs an image to create the container from, so a content-free
+placeholder is pushed to `--repo`. That image's only content is a flake that
+`throw`s: the source annotation always takes precedence over an embedded flake,
+so evaluating it means the annotation never arrived, and the throw turns the
+one silent failure mode this design has into a create-time error that names its
+own cause. `--image` names an image the cluster can already pull and skips the
+push entirely, which needs no registry credentials and no network.
+
+The reference must pin something — `?rev=`, `?narHash=`, or the
+`github:owner/repo/<commit>` form — or the command refuses it and names the
+pin; `--unpinned` overrides that for a scratch cluster. The node deliberately
+does not police pin forms (SPEC §3), which is exactly why the authoring tool
+does.
+
+External mode needs two things the packed path does not, and the shipped
+quickstart supplies neither:
+
+- **`run.imageless.*` in the containerd handler's `pod_annotations` *and*
+  `container_annotations`.** The examples and `dev/kind/kind-config.yaml`
+  allow-list only `imageless.run/*` — the production release contract — so a
+  `run.imageless.source` annotation is filtered out before the shim ever sees
+  it, and the placeholder image's flake fails the create with exactly that
+  diagnosis. `nixosModules.imageless` already passes both families.
+- **A policy prefix covering the reference.** `examples/dev-policy.json`
+  allow-lists `path:` alone, which is what an embedded flake needs and nothing
+  more; `examples/external-refs-policy.json` is the one to copy, and the
+  `github:yourorg/` in it is a placeholder to replace. Author prefixes to a
+  boundary — an unterminated `github:myorg` also authorizes
+  `github:myorg-evil/anything`.
+
+`doctor` reports whether a cluster is prepared at all:
+
+```bash
+kubectl imageless doctor --context kind-imageless
+kubectl imageless doctor --policy examples/external-refs-policy.json \
+  --source github:yourorg/agent/0123456789abcdef0123456789abcdef01234567 --json
+```
+
+It checks the RuntimeClass, the node label that RuntimeClass schedules on (read
+from the RuntimeClass, never assumed), which nodes carry it, and — offline, so
+they work with no cluster at all — a policy file and a flake reference against
+each other. The node-local half of the seam has no API representation, so
+`node-config` is a permanent skip and the report says outright that green is
+not proof a pod will start. Exit 3 means "could not look", which is a different
+answer from exit 1 "a check failed". kubectl's connection flags are forwarded
+verbatim, but they must come *after* `imageless`: kubectl stops collecting the
+plugin command path at the first flag, so `kubectl --context x imageless doctor`
+never reaches the plugin.
+
 ## Why not containix?
 
 [containix](https://github.com/atmask/containix) proved the appeal of
@@ -257,8 +318,9 @@ API.
 ## Environment variables
 
 Every knob below is read at runtime by `imageless-runc` (and, where noted, the
-resolver daemon). The NixOS module sets the operator-facing ones for you; the
-list is here so a hand-rolled deployment is not guesswork.
+resolver daemon or the kubectl plugin). The NixOS module sets the
+operator-facing ones for you; the list is here so a hand-rolled deployment is
+not guesswork.
 
 Operator-facing:
 
@@ -273,6 +335,17 @@ Operator-facing:
 | `IMAGELESS_RUNC` | the stock `runc` baked in at build time (`runc` on PATH for an unbaked build) | The real OCI runtime to delegate to after the rewrite. Set this if you install `imageless-runc` *as* `runc`, so delegation cannot recurse through `PATH`. |
 | `IMAGELESS_NIX` / `IMAGELESS_NIX_STORE` | baked at build time (`nix` / `nix-store` on PATH for an unbaked build) | The `nix` and `nix-store` binaries the materializer drives, in-process and in the daemon. `IMAGELESS_NIX_STORE` is also used for closure enumeration under `IMAGELESS_STORE_PROJECTION=closure`. |
 | `IMAGELESS_SYSTEM` | `x86_64-linux` | Nix system double for the synthesized fail-closed default policy. A loaded policy file carries its own `system` and wins, so this only matters when no policy file exists. |
+
+Client-side, read only by `kubectl-imageless`:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `IMAGELESS_KUBECTL` | `kubectl` | The kubectl `doctor` drives. A bare name is resolved on `PATH` and an absolute path is taken as given; a relative path containing a separator is refused, because it would execute whatever happens to sit there in the working directory. |
+| `DOCKER_CONFIG` | `$HOME/.docker` | Directory holding the `config.json` the push reads registry credentials from — `auths` entries and credential helpers alike. Standard Docker/BuildKit semantics; listed here only because the plugin honors it without a Docker daemon anywhere in sight. |
+
+`doctor` also reads `KUBECONFIG` and `KUBERNETES_SERVICE_HOST` — but only to
+*report* which config or in-cluster service account is in play. Resolving them
+is kubectl's job, and the plugin never second-guesses the answer.
 
 Internal / development only:
 
