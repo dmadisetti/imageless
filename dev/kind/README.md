@@ -95,6 +95,34 @@ embedded flake at container-create, GC-rooted per bundle. `kubectl exec`
 into the pod and look around: the rootfs is the flake's `#rootfs` output,
 read-only, with `/nix/store` bound alongside it.
 
+## 6. Author your own, with the kubectl plugin
+
+Steps 3 and 4 load a seed image built by Nix. `kubectl imageless run` does
+the same job for an arbitrary directory, with no Nix and no Docker on the
+client — it packs, pushes, and prints the pod:
+
+```sh
+nix build .#kubectl-imageless
+
+# A registry the node can pull from. kind's own is the usual choice:
+#   https://kind.sigs.k8s.io/docs/user/local-registry/
+./result/bin/kubectl-imageless run examples/nginx-embedded \
+  --repo localhost:5001/team/nginx --name my-nginx \
+  -- /bin/nginx -c /etc/nginx/nginx.conf -g 'daemon off;' \
+  | kubectl apply -f -
+```
+
+`localhost:5001` needs no flags: loopback registries are pushed over plain
+HTTP automatically. The pod that lands references the image by digest, never
+by tag. Two caveats worth knowing before pointing this at a shared registry:
+
+- Registries that garbage-collect untagged manifests (GHCR's cleanup
+  actions, ECR lifecycle rules with `tagStatus: untagged`) will eventually
+  reap a digest-only push. Pass `--tag` to keep a name on it; the pod
+  reference stays digest-pinned either way.
+- `--dry-run` prints the same digests and pod manifest and touches no
+  network, which is the way to inspect what would be pushed.
+
 ## Cleanup, GC, and re-runs
 
 - Teardown: `kind delete cluster --name imageless` (removes the node and its
@@ -129,6 +157,6 @@ containerd generation — a version matrix that doubles this document for
 zero additional coverage, since the seam being demonstrated (a `BinaryName`
 under the stock runc-v2 shim) is identical. The shape of the port is known
 (template the base config + the runtime table, `k3d image import`, volume
-mounts for store and policy); it becomes interesting when the
-`kubectl imageless` push flow lands, because `k3d --registry-create` is the
-easiest local-registry path.
+mounts for store and policy); now that `kubectl imageless run` pushes —
+loopback registries are plain HTTP with zero flags — `k3d --registry-create`
+is the easiest local-registry path, which is the main reason to revisit.

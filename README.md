@@ -123,16 +123,22 @@ tar and the evaluation happens on the node, under node policy:
 ```bash
 nix build .#kubectl-imageless   # `kubectl imageless …` once result/bin is on PATH
 
-kubectl imageless run ./app --repo registry.example/team/app --dry-run \
-  -- /bin/server --port=8080
+kubectl imageless run ./app --repo registry.example/team/app \
+  -- /bin/server --port=8080 | kubectl apply -f -
 ```
 
 This packs `./app` into a seed OCI image under the same staging bounds the
 node enforces (so a refusal happens at authoring time, with the offending path
-in hand), prints the layer/config/manifest digests on stderr, and writes a
-digest-pinned pod manifest on stdout, ready for `kubectl apply -f -`. Pushing
-to a registry from the plugin is the next slice; today's flow is `--dry-run`
-plus your registry tooling of choice.
+in hand), pushes it to `registry.example/team/app` by digest, prints the
+layer/config/manifest digests on stderr, and writes a digest-pinned pod
+manifest on stdout — everything but the pod manifest stays out of stdout's
+way. `--dry-run` stops before the push and needs no network. Credentials come
+from `docker login` (config.json `auths` and credential helpers; Basic and
+Bearer auth). Loopback registries like kind's `localhost:5001` are plain HTTP
+automatically; everything else is HTTPS unless you pass `--plain-http`. Some
+registries garbage-collect untagged manifests (GHCR, ECR lifecycle policies) —
+`--tag` adds a tag to protect the push while the pod reference stays
+digest-pinned.
 
 ## Why not containix?
 
