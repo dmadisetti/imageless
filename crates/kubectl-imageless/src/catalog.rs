@@ -109,12 +109,7 @@ pub fn parse_coordinate(value: &str) -> Result<Coordinate, String> {
     let (issuer, name) = identity.split_once('/').ok_or_else(|| {
         format!("`{value}` is not issuer/name[:channel] — an issuer and a release name are both required")
     })?;
-    if !valid_segment(channel) {
-        return Err(format!(
-            "channel `{channel}` must be 1-63 characters of [a-z0-9-], not starting or ending \
-             with a dash"
-        ));
-    }
+    check_channel(channel)?;
     if issuer.is_empty() || name.is_empty() {
         return Err(format!("`{value}` is not issuer/name[:channel]"));
     }
@@ -123,6 +118,17 @@ pub fn parse_coordinate(value: &str) -> Result<Coordinate, String> {
         name: name.to_string(),
         channel: channel.to_string(),
     })
+}
+
+fn check_channel(channel: &str) -> Result<(), String> {
+    if valid_segment(channel) {
+        Ok(())
+    } else {
+        Err(format!(
+            "channel `{channel}` must be 1-63 characters of [a-z0-9-], not starting or ending \
+             with a dash"
+        ))
+    }
 }
 
 /// The same shape `imageless::release::valid_identifier` enforces, applied to a
@@ -143,8 +149,13 @@ pub fn resolve(
     coordinate: &Coordinate,
     timeout: Duration,
 ) -> Result<String, String> {
-    // Every segment is validated above, so none can be `..` or contain a
-    // separator; the join below cannot leave the catalog.
+    // Both halves of the path are validated here rather than trusted from the
+    // caller. `parse_coordinate` checks the same things, but `Coordinate`'s
+    // fields are public, so that check belongs to whoever built the value —
+    // and the guarantee this join needs is that no segment is `..` or carries a
+    // separator. Checking twice costs a byte scan; not checking costs a read
+    // outside the catalog.
+    check_channel(&coordinate.channel)?;
     let relative = format!(
         "refs/{}/{}",
         segments(&coordinate.name)?.join("/"),
@@ -401,6 +412,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("symlink"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_refuses_a_traversing_channel_it_did_not_parse_itself() {
+        // `Coordinate`'s fields are public, so the traversal guard cannot live
+        // only in `parse_coordinate`: this is the shape that would reach the
+        // path join if a future caller built the value some other way.
+        let root = temporary("hand-built");
+        let error = resolve(
+            &Catalog::Local(root.clone()),
+            &Coordinate {
+                issuer: "example".to_string(),
+                name: "agent".to_string(),
+                channel: "../../etc/passwd".to_string(),
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.contains("[a-z0-9-]"), "{error}");
         std::fs::remove_dir_all(root).unwrap();
     }
 
