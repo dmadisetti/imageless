@@ -190,39 +190,27 @@ fn diagnose(kubectl: &Kubectl, options: &Options) -> Report {
     } else {
         let class =
             kubectl.json_or_absent(&["get", "runtimeclass", &options.runtime_class, "-o", "json"]);
-        let (check, selector) = match &class {
+        report.push(match &class {
             Ok(class) => check_runtime_class(class.as_ref(), &options.runtime_class),
-            Err(Failure::Forbidden(message)) => (
-                Check::new(
-                    "runtime-class",
-                    Status::Skip,
-                    format!(
-                        "cannot read RuntimeClass `{}`: {message}",
-                        options.runtime_class
-                    ),
-                )
-                .detail(
-                    "RuntimeClasses are cluster-scoped and developers frequently are not \
-                     granted them",
+            Err(Failure::Forbidden(message)) => Check::new(
+                "runtime-class",
+                Status::Skip,
+                format!(
+                    "cannot read RuntimeClass `{}`: {message}",
+                    options.runtime_class
                 ),
-                None,
+            )
+            .detail(
+                "RuntimeClasses are cluster-scoped and developers frequently are not granted them",
             ),
-            Err(failure) => (
-                Check::new(
-                    "runtime-class",
-                    Status::Fail,
-                    format!("could not read RuntimeClass: {}", describe(failure)),
-                ),
-                None,
+            Err(failure) => Check::new(
+                "runtime-class",
+                Status::Fail,
+                format!("could not read RuntimeClass: {}", describe(failure)),
             ),
-        };
-        report.push(check);
+        });
         let class = class.ok().flatten();
-        let (scheduling, selector) = check_scheduling(
-            class.as_ref(),
-            &options.runtime_class,
-            selector.unwrap_or_default(),
-        );
+        let (scheduling, selector) = check_scheduling(class.as_ref(), &options.runtime_class);
         report.push(scheduling);
         report.push(match kubectl.json(&["get", "nodes", "-o", "json"]) {
             Ok(nodes) => {
@@ -372,24 +360,21 @@ fn minor(version: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-fn check_runtime_class(class: Option<&Value>, name: &str) -> (Check, Option<Selector>) {
+fn check_runtime_class(class: Option<&Value>, name: &str) -> Check {
     let Some(class) = class else {
-        return (
-            Check::new(
-                "runtime-class",
-                Status::Fail,
-                format!(
-                    "RuntimeClass `{name}` does not exist — a pod naming it in \
+        return Check::new(
+            "runtime-class",
+            Status::Fail,
+            format!(
+                "RuntimeClass `{name}` does not exist — a pod naming it in \
                      runtimeClassName never starts"
-                ),
-            )
-            .remedy("kubectl apply -f examples/runtimeclass.yaml")
-            .remedy("pass --runtime-class NAME if your cluster names it differently"),
-            None,
-        );
+            ),
+        )
+        .remedy("kubectl apply -f examples/runtimeclass.yaml")
+        .remedy("pass --runtime-class NAME if your cluster names it differently");
     };
     let handler = class["handler"].as_str().unwrap_or_default();
-    let check = if handler == name {
+    if handler == name {
         Check::new(
             "runtime-class",
             Status::Pass,
@@ -405,11 +390,10 @@ fn check_runtime_class(class: Option<&Value>, name: &str) -> (Check, Option<Sele
                  handler, not the RuntimeClass name"
             ),
         )
-    };
-    (check, Some(Vec::new()))
+    }
 }
 
-fn check_scheduling(class: Option<&Value>, name: &str, _seed: Selector) -> (Check, Selector) {
+fn check_scheduling(class: Option<&Value>, name: &str) -> (Check, Selector) {
     let Some(class) = class else {
         return (
             Check::new("scheduling", Status::Skip, "no RuntimeClass to read"),
@@ -789,7 +773,7 @@ mod tests {
 
     #[test]
     fn an_absent_runtime_class_is_fatal_and_names_the_example() {
-        let (check, _) = check_runtime_class(None, "imageless");
+        let check = check_runtime_class(None, "imageless");
         assert_eq!(check.status, Status::Fail);
         assert!(check.remedy.iter().any(|r| r.contains("runtimeclass.yaml")));
     }
@@ -797,7 +781,7 @@ mod tests {
     #[test]
     fn a_handler_that_differs_from_the_name_is_called_out() {
         let class = class("imageless-v2", None);
-        let (check, _) = check_runtime_class(Some(&class), "imageless");
+        let check = check_runtime_class(Some(&class), "imageless");
         assert_eq!(check.status, Status::Warn);
         // The containerd key is the handler, not the RuntimeClass name.
         assert!(
@@ -811,7 +795,7 @@ mod tests {
         // Nothing in the shim or library reads this label; hardcoding it would
         // make doctor wrong on every cluster that chose its own.
         let class = class("imageless", Some(json!({"example.com/imageless": "yes"})));
-        let (check, selector) = check_scheduling(Some(&class), "imageless", Vec::new());
+        let (check, selector) = check_scheduling(Some(&class), "imageless");
         assert_eq!(check.status, Status::Pass);
         assert_eq!(
             selector,
@@ -822,7 +806,7 @@ mod tests {
     #[test]
     fn a_runtime_class_without_scheduling_warns_about_silent_scheduling() {
         let class = class("imageless", None);
-        let (check, selector) = check_scheduling(Some(&class), "imageless", Vec::new());
+        let (check, selector) = check_scheduling(Some(&class), "imageless");
         assert_eq!(check.status, Status::Warn);
         assert!(selector.is_empty());
     }
