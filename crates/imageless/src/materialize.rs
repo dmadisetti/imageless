@@ -97,6 +97,20 @@ impl ResolutionError {
             true,
         )
     }
+
+    /// A timeout that carries what the underlying Nix process last said.
+    ///
+    /// The stage alone cannot distinguish a materializer wedged on its first
+    /// store path from one that was copying its six-hundredth when the deadline
+    /// arrived, and those call for opposite responses. The non-timeout arms
+    /// have always interpolated their error; only this one threw it away.
+    pub(crate) fn timeout_with(stage: &str, detail: &str) -> Self {
+        Self::new(
+            ErrorCategory::Timeout,
+            format!("request deadline exceeded {stage}: {detail}"),
+            true,
+        )
+    }
 }
 
 impl std::fmt::Display for ResolutionError {
