@@ -39,6 +39,11 @@ pub const FLAKE: &str = r#"# Reached only when this pod's run.imageless.source a
 /// The lock nix writes for an input-less flake. Shipped so evaluation does not
 /// try to write one into the staged copy — which is read-only to the workload
 /// and, on a node without network egress, would fail before reaching the throw.
+///
+/// Checked rather than assumed: `nix build --offline path:<read-only copy>#rootfs`,
+/// with no lock-file flags, reaches the `throw` and prints its text. Both
+/// halves matter — an air-gapped node and a copy nix cannot write to are the
+/// conditions under which this diagnosis has to arrive.
 pub const LOCK: &str = r#"{"nodes":{"root":{}},"root":"root","version":7}"#;
 
 /// The placeholder layer: byte-identical for every user of a given build, so
