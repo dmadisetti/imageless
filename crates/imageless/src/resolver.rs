@@ -1851,7 +1851,11 @@ mod tests {
         let dir = temporary("deadlines");
         let nix = fake_nix(&dir, "sleep 0.3");
         std::env::set_var("FAKE_STORE", STORE);
-        let resolver = resolver(nix, 1, Duration::from_secs(2));
+        // The leader must outlive three 40 ms requests without hitting its own
+        // deadline: it sleeps 0.3 s twice (realization, then its GC root), and
+        // a 1 s deadline left only 1.6x of headroom — enough to fail roughly
+        // one run in ten with the rest of the suite loading the machine.
+        let resolver = resolver(nix, 1, Duration::from_secs(8));
         let one = dir.join("one");
         let two = dir.join("two");
         let three = dir.join("three");
@@ -1861,7 +1865,7 @@ mod tests {
         let leader = {
             let resolver = resolver.clone();
             thread::spawn(move || {
-                resolver.resolve(request(one, Materialize::Closure(STORE.into()), 1000))
+                resolver.resolve(request(one, Materialize::Closure(STORE.into()), 6000))
             })
         };
         thread::sleep(Duration::from_millis(25));
@@ -1933,15 +1937,23 @@ rmdir "{state}/lock"
     fn follower_gc_root_registration_uses_the_original_deadline() {
         let dir = temporary("root-timeout");
         let leader_started = dir.join("leader-started");
+        // The follower's deadline has to outlast the leader by a wide margin
+        // and expire well inside its own root registration, because a deadline
+        // that runs out in the *wait* is a timeout too — with a different
+        // diagnostic, which is exactly what this test distinguishes. The
+        // leader's nominal ~160 ms of work (realization, then its own GC root)
+        // is what the follower waits through, and the original 250 ms deadline
+        // left only 1.6x of headroom for it — enough to fail roughly one run in
+        // six with the rest of the suite loading the machine.
         let nix = fake_nix(
             &dir,
             &format!(
-                "case \"$root\" in *slow-root*) sleep 0.4 ;; *leader*) touch {}; sleep 0.08 ;; esac",
+                "case \"$root\" in *slow-root*) sleep 4 ;; *leader*) touch {}; sleep 0.08 ;; esac",
                 leader_started.display()
             ),
         );
         std::env::set_var("FAKE_STORE", STORE);
-        let resolver = resolver(nix, 2, Duration::from_secs(2));
+        let resolver = resolver(nix, 2, Duration::from_secs(6));
         let leader_bundle = dir.join("leader");
         let slow_bundle = dir.join("slow-root");
         std::fs::create_dir(&leader_bundle).unwrap();
@@ -1965,7 +1977,7 @@ rmdir "{state}/lock"
             .resolve(request(
                 slow_bundle,
                 Materialize::Closure(STORE.into()),
-                250,
+                1500,
             ))
             .unwrap_err();
         assert_eq!(error.category, ErrorCategory::Timeout);
