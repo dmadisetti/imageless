@@ -80,6 +80,8 @@ const USAGE: &str =
      Usage:\n\
      \x20 kubectl imageless run <dir> --repo HOST/REPO [flags] -- COMMAND [ARG...]\n\
      \x20 kubectl imageless run --external <flake-ref> [flags] -- COMMAND [ARG...]\n\
+     \x20 kubectl imageless run --release <issuer>/<name>[:channel] --catalog SRC \\\n\
+     \x20                       [flags] -- COMMAND [ARG...]\n\
      \x20 kubectl imageless pin <issuer>/<name>[:channel] --catalog SRC\n\
      \x20 kubectl imageless doctor [flags]\n\
      \x20 kubectl imageless version\n\
@@ -95,12 +97,22 @@ const USAGE: &str =
      from: a content-free placeholder is pushed to --repo unless --image names\n\
      one the cluster can already pull.\n\
      \n\
+     With --release the pod names a digest-addressed release the node resolves\n\
+     against its own issuer catalogs — the cache-only production profile, which\n\
+     evaluates nothing. The channel is resolved here, against --catalog, and the\n\
+     pod records the resulting digest: republishing the channel afterwards does\n\
+     not change what an applied pod runs. Nodes never resolve channels.\n\
+     \n\
      Flags:\n\
-     \x20 --repo HOST/REPO      repository the pushed manifest belongs to (required;\n\
-     \x20                       with --external, --image replaces it)\n\
+     \x20 --repo HOST/REPO      repository the pushed manifest belongs to (required\n\
+     \x20                       when packing; --image replaces it otherwise)\n\
      \x20 --external            deploy <flake-ref> instead of packing a directory\n\
+     \x20 --release             deploy <issuer>/<name>[:channel] instead of packing\n\
+     \x20 --catalog SRC         --release only: issuer catalog to resolve the channel\n\
+     \x20                       against — an https:// base URL or a local directory\n\
      \x20 --unpinned            allow an --external reference that pins nothing\n\
-     \x20 --image REF           --external only: an image the cluster can already pull\n\
+     \x20 --image REF           an image the cluster can already pull (--external and\n\
+     \x20                       --release only)\n\
      \x20 --name NAME           pod name (default: derived from the directory, or from\n\
      \x20                       the reference's repository — never its revision)\n\
      \x20 --namespace NS        pod namespace\n\
@@ -320,6 +332,10 @@ enum ParsedRun {
 enum Source {
     Directory(PathBuf),
     External(String),
+    /// A release coordinate as typed — `issuer/name[:channel]`. It is resolved
+    /// against `--catalog` before the pod is written, so what lands in the
+    /// manifest is always a digest.
+    Release(String),
 }
 
 #[cfg_attr(test, derive(Debug))]
@@ -327,6 +343,8 @@ struct RunOptions {
     source: Source,
     /// `None` only in external mode with `--image`, where nothing is pushed.
     repo: Option<String>,
+    /// Issuer catalog for `--release`. Required there and refused elsewhere.
+    catalog: Option<String>,
     image: Option<String>,
     unpinned: bool,
     name: Option<String>,
@@ -344,7 +362,9 @@ struct RunOptions {
 fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
     let mut source = None;
     let mut repo = None;
+    let mut catalog = None;
     let mut external = false;
+    let mut release = false;
     let mut unpinned = false;
     let mut image = None;
     let mut name = None;
@@ -375,7 +395,9 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
             }
             "--help" | "-h" => return Ok(ParsedRun::Help),
             "--repo" => repo = Some(value("--repo")?),
+            "--catalog" => catalog = Some(value("--catalog")?),
             "--external" => external = true,
+            "--release" => release = true,
             "--unpinned" => unpinned = true,
             "--image" => image = Some(value("--image")?),
             "--name" => name = Some(value("--name")?),
@@ -393,12 +415,21 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
         }
     }
 
+    if external && release {
+        return Err(
+            "pass --external (a flake the node evaluates) or --release (a digest-addressed \
+             release the node resolves), not both: SPEC §3 makes the two annotation families \
+             mutually exclusive, and a node refuses a pod carrying both"
+                .to_string(),
+        );
+    }
     // Flags that only make sense for one mode are refused rather than ignored:
     // a silently dropped `--tag` looks like it worked.
-    if !external {
+    let packs = !external && !release;
+    if packs {
         if image.is_some() {
             return Err(
-                "--image applies to --external references; a packed directory's image \
+                "--image applies to --external and --release; a packed directory's image \
                  is the seed pushed to --repo"
                     .to_string(),
             );
@@ -411,8 +442,31 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
             );
         }
     } else if include_vcs {
+        return Err(format!(
+            "--include-vcs applies to a packed directory; {} packs nothing",
+            if external { "--external" } else { "--release" }
+        ));
+    }
+    if release {
+        if unpinned {
+            return Err(
+                "--unpinned applies to --external references; a release is digest-addressed \
+                 by definition, and `pin` resolves the channel before the pod is written"
+                    .to_string(),
+            );
+        }
+        if output.is_some() {
+            return Err(
+                "--output selects a flake output; a release manifest names its own rootfs \
+                 and process metadata"
+                    .to_string(),
+            );
+        }
+    }
+    if catalog.is_some() && !release {
         return Err(
-            "--include-vcs applies to a packed directory; --external packs nothing".to_string(),
+            "--catalog resolves a --release channel; nothing else here consults a catalog"
+                .to_string(),
         );
     }
     if image.is_some() {
@@ -436,6 +490,8 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
 
     let source = source.ok_or(if external {
         "an external flake reference is required after --external"
+    } else if release {
+        "a release coordinate is required after --release: issuer/name[:channel]"
     } else {
         "a source directory is required"
     })?;
@@ -452,21 +508,34 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
             }
         }
         Source::External(source)
+    } else if release {
+        // Parsed here so a typo fails before anything is pushed; resolved later,
+        // because resolution touches the network.
+        catalog::parse_coordinate(&source)?;
+        Source::Release(source)
     } else {
         Source::Directory(PathBuf::from(source))
     };
-    if external && repo.is_none() && image.is_none() {
+    if release && catalog.is_none() {
         return Err(
-            "--external needs somewhere to get the pod's image: --repo HOST/REPO to push \
-             a placeholder to, or --image REF naming one the cluster can already pull"
+            "--release needs --catalog: a client has no node policy to look an issuer's \
+             catalog up in, and guessing one would resolve a channel against a catalog \
+             nobody named"
                 .to_string(),
         );
     }
-    if !external && repo.is_none() {
+    if !packs && repo.is_none() && image.is_none() {
+        return Err(format!(
+            "{} needs somewhere to get the pod's image: --repo HOST/REPO to push \
+             a placeholder to, or --image REF naming one the cluster can already pull",
+            if external { "--external" } else { "--release" }
+        ));
+    }
+    if packs && repo.is_none() {
         return Err("--repo HOST/REPO is required".to_string());
     }
-    // External mode with `--image` pushes nothing, so there is no push target
-    // to validate — every check below is about one.
+    // `--image` pushes nothing, so there is no push target to validate — every
+    // check below is about one.
     if let Some(repo) = &repo {
         // Requiring a `/` enforces the promised HOST/REPO shape; a bare name
         // would silently resolve against docker.io/library on the node. A colon
@@ -518,6 +587,7 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
     }
     Ok(ParsedRun::Run(Box::new(RunOptions {
         source,
+        catalog,
         repo,
         image,
         unpinned,
@@ -538,7 +608,90 @@ fn run(options: &RunOptions) -> ExitCode {
     match &options.source {
         Source::Directory(directory) => run_packed(options, directory),
         Source::External(reference) => run_external(options, reference),
+        Source::Release(coordinate) => run_release(options, coordinate),
     }
+}
+
+/// Pin-on-apply: resolve the channel now, write the digest into the pod, and
+/// never let the coordinate itself reach the manifest.
+///
+/// This is the whole point of the mode. A node resolves digests and never
+/// channels (SPEC §6), so if the channel were carried through, the pod would
+/// name something no node would accept. Resolving here means the digest is
+/// chosen once, at authoring time, by whoever ran this command — and the pod is
+/// a record of that decision rather than a subscription to the catalog.
+fn run_release(options: &RunOptions, coordinate: &str) -> ExitCode {
+    let catalog_source = options
+        .catalog
+        .as_deref()
+        .expect("release mode requires --catalog");
+    let pinned = catalog::parse_coordinate(coordinate).and_then(|coordinate| {
+        let catalog = catalog::Catalog::parse(catalog_source)?;
+        let digest = catalog::resolve(&catalog, &coordinate, std::time::Duration::from_secs(10))?;
+        let reference = format!("{}/{}@sha256:{digest}", coordinate.issuer, coordinate.name);
+        // The node's parser has the last word, exactly as in `pin`.
+        imageless::ReleaseReference::parse(&reference)
+            .map_err(|error| error.to_string())
+            .map(|_| (coordinate, reference))
+    });
+    let (coordinate, reference) = match pinned {
+        Ok(pinned) => pinned,
+        Err(error) => return fail(error),
+    };
+    eprintln!(
+        "notice: `{}/{}:{}` resolved to {reference} — the pod records that digest, so \
+         republishing the channel does not change what this pod runs.",
+        coordinate.issuer, coordinate.name, coordinate.channel
+    );
+    eprintln!(
+        "notice: the node must allow-list issuer `{}` in its policy, with a catalog it \
+         trusts and the substituters the release's closure comes from. This command's \
+         --catalog is the client's; a node never reads it.",
+        coordinate.issuer
+    );
+
+    let pod_image = match (&options.image, &options.repo) {
+        (Some(image), _) => {
+            eprintln!(
+                "notice: --image `{image}` is used verbatim; nothing here checks the node can pull\n\
+                 it, and its config's Env, User and WorkingDir still reach the container."
+            );
+            image.clone()
+        }
+        (None, Some(repo)) => {
+            let image = oci::assemble(placeholder::layer(), &options.arch);
+            report_digests(&image);
+            eprintln!(
+                "notice: the image is a placeholder — Kubernetes requires one and the node replaces\n\
+                 the root filesystem from the release manifest. Its flake fails the container\n\
+                 create with a diagnosis if imageless.run/release-v1 never reaches the runtime."
+            );
+            if !options.dry_run {
+                if let Err(error) = push(options, repo, &image) {
+                    return fail(error);
+                }
+            }
+            format!("{repo}@{}", image.manifest_digest)
+        }
+        // The parser refuses this combination; reaching it is a bug here.
+        (None, None) => return fail("--release needs --repo or --image".to_string()),
+    };
+
+    let name = options
+        .name
+        .clone()
+        // The digest is deliberately not part of the name: a pod named after
+        // one revision of a channel is a pod nobody can `kubectl get` twice.
+        .unwrap_or_else(|| podspec::sanitize_name(&coordinate.name));
+    emit(&podspec::PodSpec {
+        name: &name,
+        namespace: options.namespace.as_deref(),
+        image: &pod_image,
+        runtime_class: &options.runtime_class,
+        deploy: podspec::Deploy::Release(&reference),
+        output: options.output.as_deref(),
+        command: &options.command,
+    })
 }
 
 fn run_packed(options: &RunOptions, directory: &Path) -> ExitCode {
@@ -599,7 +752,7 @@ fn run_packed(options: &RunOptions, directory: &Path) -> ExitCode {
         namespace: options.namespace.as_deref(),
         image: &format!("{repo}@{}", image.manifest_digest),
         runtime_class: &options.runtime_class,
-        source: podspec::EMBEDDED_SOURCE,
+        deploy: podspec::Deploy::Source(podspec::EMBEDDED_SOURCE),
         output: options.output.as_deref(),
         command: &options.command,
     })
@@ -681,7 +834,7 @@ fn run_external(options: &RunOptions, reference: &str) -> ExitCode {
         namespace: options.namespace.as_deref(),
         image: &pod_image,
         runtime_class: &options.runtime_class,
-        source: reference,
+        deploy: podspec::Deploy::Source(reference),
         output: options.output.as_deref(),
         command: &options.command,
     })
@@ -781,14 +934,70 @@ mod tests {
     fn directory(options: &RunOptions) -> &Path {
         match &options.source {
             Source::Directory(directory) => directory,
-            Source::External(reference) => panic!("expected a directory, got `{reference}`"),
+            other => panic!("expected a directory, got {other:?}"),
         }
     }
 
     fn external(options: &RunOptions) -> &str {
         match &options.source {
             Source::External(reference) => reference,
-            Source::Directory(directory) => panic!("expected a reference, got {directory:?}"),
+            other => panic!("expected a flake reference, got {other:?}"),
+        }
+    }
+
+    fn release(options: &RunOptions) -> &str {
+        match &options.source {
+            Source::Release(coordinate) => coordinate,
+            other => panic!("expected a release coordinate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_release_coordinate_is_kept_unresolved_until_the_catalog_is_read() {
+        // The parser validates the shape but never touches the network, so a
+        // typo fails before anything is pushed and `--dry-run` stays offline
+        // right up to the point where a catalog is genuinely needed.
+        let options = parse(&[
+            "--release",
+            "example/agent:edge",
+            "--catalog",
+            "/srv/catalog",
+            "--image",
+            "localhost/placeholder:v1",
+            "--",
+            "/bin/agent",
+        ])
+        .unwrap();
+        assert_eq!(release(&options), "example/agent:edge");
+        assert_eq!(options.catalog.as_deref(), Some("/srv/catalog"));
+    }
+
+    #[test]
+    fn a_catalog_without_release_is_refused_rather_than_ignored() {
+        for arguments in [
+            vec![
+                "./app",
+                "--repo",
+                "r.example/t/a",
+                "--catalog",
+                "/srv/catalog",
+            ],
+            vec![
+                "--external",
+                "github:o/r/0123456789abcdef0123456789abcdef01234567",
+                "--repo",
+                "r.example/t/a",
+                "--catalog",
+                "/srv/catalog",
+            ],
+        ] {
+            let mut words = arguments.clone();
+            words.extend(["--", "/bin/true"]);
+            let error = parse(&words).unwrap_err();
+            assert!(
+                error.contains("--catalog resolves a --release channel"),
+                "{error}"
+            );
         }
     }
 

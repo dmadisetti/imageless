@@ -1,36 +1,42 @@
-//! The image an external-reference pod is created from.
+//! The image a pod is created from when nothing is packed.
 //!
-//! Kubernetes requires `containers[].image`, but `--external` packs nothing:
-//! the filesystem comes from the node's evaluation of the flake reference. So
-//! the plugin synthesizes a content-free image whose only job is to be
-//! pullable — and, if the runtime never receives the annotation that makes the
-//! pod imageless, to say so.
+//! Kubernetes requires `containers[].image`, but neither `--external` nor
+//! `--release` packs one: the filesystem comes from what the node resolves
+//! from the pod's annotation. So the plugin synthesizes a content-free image
+//! whose only job is to be pullable — and, if the runtime never receives that
+//! annotation, to say so.
 //!
 //! The flake below exists to fail. `expansion_request` consults an embedded
-//! flake only when no source annotation is present, so this one can never
-//! shadow the external reference; reaching it at all means the annotation was
-//! dropped — the single silent failure mode this design has. Evaluating a
+//! flake only when neither a release nor a source annotation is present, so
+//! this one can never shadow either; reaching it at all means the annotation
+//! was dropped — the single silent failure mode this design has. Evaluating a
 //! `throw` converts that silence into a create-time error carrying its own
 //! diagnosis, which is why the placeholder is a throwing flake rather than an
 //! empty layer (`exec: no such file or directory`) or a borrowed public image
 //! (whose Env, User and WorkingDir CRI would merge into the container).
+//!
+//! One image serves both modes. The text therefore names both annotation
+//! families rather than guessing which one went missing: the runtime cannot
+//! tell us what it never received, and a diagnosis that confidently named the
+//! wrong one would send a reader to the wrong line of containerd's config.
 
 use crate::pack::{LayerWriter, LAYER_ROOT};
 
 /// Reached only when the annotation never arrived, so the text is a diagnosis
 /// rather than a rootfs. Editing it changes every future pod's image digest —
 /// see the golden test below.
-pub const FLAKE: &str = r#"# Reached only when this pod's run.imageless.source annotation never arrived:
-# the annotation takes precedence over this flake (SPEC.md §3), so evaluating
-# it at all means the runtime never saw it.
+pub const FLAKE: &str = r#"# Reached only when this pod's imageless annotation never arrived: an
+# annotation takes precedence over this flake (SPEC.md §3), so evaluating it at
+# all means the runtime never saw one.
 {
   outputs = _: {
     rootfs = throw ''
-      imageless: this pod deploys an external flake reference, but the runtime
-      received no run.imageless.source annotation. The containerd runtime
-      handler must allow-list run.imageless.* in pod_annotations and
-      container_annotations (examples/containerd-config.toml); see
-      `kubectl imageless doctor`.
+      imageless: this pod's root filesystem was to come from an imageless
+      annotation, but the runtime received none. The containerd runtime handler
+      must allow-list the annotation family in BOTH pod_annotations and
+      container_annotations: imageless.run/* for a digest-addressed release,
+      run.imageless.* for a flake reference (examples/containerd-config.toml).
+      Run `kubectl imageless doctor` to see what this cluster is missing.
     '';
   };
 }
@@ -80,7 +86,7 @@ mod tests {
         let image = oci::assemble(layer(), "amd64");
         assert_eq!(
             image.layer_digest,
-            "sha256:35dd2d7f57ccb49a27cd0cc54e808c7988483ce621edfd0a6728edd7e653daac"
+            "sha256:c7c6f7e813a2d533b7c93cb3aedf2c4f09c42fd1f8d157922d22392660bd3999"
         );
     }
 
@@ -95,10 +101,15 @@ mod tests {
             text.contains("throw"),
             "the placeholder must fail evaluation"
         );
-        assert!(
-            text.contains("run.imageless.source"),
-            "the diagnosis must name the missing annotation"
-        );
+        // One image serves both modes, and the runtime cannot report which
+        // annotation it never received — so the diagnosis names both families
+        // rather than sending a reader to the wrong line of containerd's config.
+        for family in ["imageless.run/*", "run.imageless.*"] {
+            assert!(
+                text.contains(family),
+                "the diagnosis must name the {family} annotation family"
+            );
+        }
     }
 
     #[test]

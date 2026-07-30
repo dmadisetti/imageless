@@ -234,3 +234,72 @@ fn pin_without_a_catalog_is_a_usage_error_not_a_guess() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("--catalog is required"), "{stderr}");
 }
+
+#[test]
+fn a_release_pod_records_the_digest_the_channel_pointed_at() {
+    let root = catalog("release");
+    let output = binary()
+        .args(["run", "--release", "example/agent", "--catalog"])
+        .arg(&root)
+        .args(["--image", "localhost/placeholder:v1", "--", "/bin/agent"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pod: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    // The pinned digest, never the channel: a node resolves digests only.
+    assert_eq!(
+        pod["metadata"]["annotations"]["imageless.run/release-v1"],
+        format!("example/agent@sha256:{DIGEST}")
+    );
+    assert!(pod["metadata"]["annotations"]["run.imageless.source"].is_null());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("republishing the channel"), "{stderr}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn release_and_external_together_are_refused_by_the_parser() {
+    // SPEC §3 makes the two annotation families mutually exclusive, and a node
+    // refuses a pod carrying both — so this never reaches a cluster to find out.
+    let output = binary()
+        // Both are boolean flags over one positional, so this is the shape a
+        // user actually types when they mean both.
+        .args([
+            "run",
+            "--release",
+            "--external",
+            "example/agent",
+            "--repo",
+            "registry.example/team/app",
+            "--",
+            "/bin/agent",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("not both"), "{stderr}");
+}
+
+#[test]
+fn a_release_without_a_catalog_names_what_is_missing() {
+    let output = binary()
+        .args([
+            "run",
+            "--release",
+            "example/agent",
+            "--image",
+            "localhost/placeholder:v1",
+            "--",
+            "/bin/agent",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--release needs --catalog"), "{stderr}");
+}
