@@ -171,8 +171,14 @@ fn segments(name: &str) -> Result<Vec<&str>, String> {
 
 fn read_local(directory: &Path, relative: &str) -> Result<String, String> {
     let path = directory.join(relative);
-    let metadata =
-        std::fs::symlink_metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            // A mistyped channel is the likeliest failure here, and the answer
+            // is one readdir away — so give it rather than the raw errno.
+            return not_published(&path);
+        }
+        format!("{}: {error}", path.display())
+    })?;
     if metadata.is_symlink() {
         // A symlink is how a pointer would escape the catalog, and following
         // one silently would resolve a channel against a file the publisher
@@ -190,6 +196,36 @@ fn read_local(directory: &Path, relative: &str) -> Result<String, String> {
         ));
     }
     std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// `refs/<name>/<channel>` is absent: name the channel, and list its siblings
+/// when the release itself is published.
+fn not_published(path: &Path) -> String {
+    let channel = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let Some(directory) = path.parent() else {
+        return format!("channel `{channel}` is not published");
+    };
+    let mut published: Vec<String> = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    if published.is_empty() {
+        return format!(
+            "channel `{channel}` is not published — no channels exist at {}",
+            directory.display()
+        );
+    }
+    published.sort();
+    format!(
+        "channel `{channel}` is not published; {} has: {}",
+        directory.display(),
+        published.join(", ")
+    )
 }
 
 fn read_https(base: &str, relative: &str, timeout: Duration) -> Result<String, String> {

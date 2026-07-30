@@ -49,6 +49,18 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("pin") => match parse_pin(&arguments[1..]) {
+            Ok(ParsedPin::Help) => {
+                println!("{PIN_USAGE}");
+                ExitCode::SUCCESS
+            }
+            Ok(ParsedPin::Pin(options)) => pin(&options),
+            Err(error) => {
+                eprintln!("kubectl-imageless: {error}\n");
+                eprintln!("{PIN_USAGE}");
+                ExitCode::from(2)
+            }
+        },
         Some("version") => {
             println!("kubectl-imageless {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -68,6 +80,7 @@ const USAGE: &str =
      Usage:\n\
      \x20 kubectl imageless run <dir> --repo HOST/REPO [flags] -- COMMAND [ARG...]\n\
      \x20 kubectl imageless run --external <flake-ref> [flags] -- COMMAND [ARG...]\n\
+     \x20 kubectl imageless pin <issuer>/<name>[:channel] --catalog SRC\n\
      \x20 kubectl imageless doctor [flags]\n\
      \x20 kubectl imageless version\n\
      \n\
@@ -104,6 +117,30 @@ const USAGE: &str =
      \x20                       *.localhost, 127.0.0.1 and [::1] use http automatically)\n\
      \x20 --dry-run             print digests and the pod manifest; no network";
 
+const PIN_USAGE: &str =
+    "kubectl imageless pin — resolve a release channel to the digest a node accepts\n\
+     \n\
+     Usage:\n\
+     \x20 kubectl imageless pin <issuer>/<name>[:channel] --catalog SRC\n\
+     \n\
+     Reads the catalog's refs/<name>/<channel> pointer and prints\n\
+     issuer/name@sha256:<digest> on stdout — the only release form an\n\
+     imageless.run/release-v1 annotation may carry. The channel defaults to\n\
+     `stable`.\n\
+     \n\
+     This is client-side only. A node resolves digests and never channels\n\
+     (SPEC §6): node-side resolution of a mutable pointer would make what a node\n\
+     runs depend on what the catalog said at container start, rather than on\n\
+     what the pod's author approved. Pinning here is what keeps that promise —\n\
+     the digest is chosen once, by you, and recorded.\n\
+     \n\
+     Flags:\n\
+     \x20 --catalog SRC         issuer catalog: an https:// base URL or a local\n\
+     \x20                       directory (required). http:// has no override\n\
+     \x20 --timeout-seconds N   bound on the pointer fetch (default: 10)\n\
+     \n\
+     Exit: 0 resolved, 1 the channel could not be resolved, 2 usage.";
+
 const DOCTOR_USAGE: &str = "kubectl imageless doctor — report whether a cluster is prepared\n\
      \n\
      Usage:\n\
@@ -131,6 +168,83 @@ const DOCTOR_USAGE: &str = "kubectl imageless doctor — report whether a cluste
      \x20 --strict              treat warnings as failures (exit 1)\n\
      \n\
      Exit: 0 healthy, 1 a check failed, 2 usage, 3 the cluster could not be probed.";
+
+#[cfg_attr(test, derive(Debug))]
+enum ParsedPin {
+    Help,
+    Pin(PinOptions),
+}
+
+#[cfg_attr(test, derive(Debug))]
+struct PinOptions {
+    coordinate: String,
+    catalog: String,
+    timeout: std::time::Duration,
+}
+
+fn parse_pin(arguments: &[String]) -> Result<ParsedPin, String> {
+    let mut coordinate = None;
+    let mut catalog = None;
+    let mut timeout = 10u64;
+
+    let mut iterator = arguments.iter();
+    while let Some(argument) = iterator.next() {
+        let mut value = |flag: &str| match iterator.next() {
+            Some(next) if !next.starts_with('-') => Ok(next.clone()),
+            _ => Err(format!("{flag} requires a value")),
+        };
+        match argument.as_str() {
+            "--help" | "-h" => return Ok(ParsedPin::Help),
+            "--catalog" => catalog = Some(value("--catalog")?),
+            "--timeout-seconds" => {
+                let raw = value("--timeout-seconds")?;
+                timeout = raw
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|seconds| (1..=600).contains(seconds))
+                    .ok_or_else(|| format!("--timeout-seconds `{raw}` must be 1-600"))?;
+            }
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            positional if coordinate.is_none() => coordinate = Some(positional.to_string()),
+            extra => return Err(format!("unexpected argument `{extra}`")),
+        }
+    }
+    Ok(ParsedPin::Pin(PinOptions {
+        coordinate: coordinate.ok_or("a release coordinate is required: issuer/name[:channel]")?,
+        catalog: catalog.ok_or(
+            "--catalog is required: this command has no node policy to read an issuer's \
+             catalog from",
+        )?,
+        timeout: std::time::Duration::from_secs(timeout),
+    }))
+}
+
+fn pin(options: &PinOptions) -> ExitCode {
+    let resolved = catalog::parse_coordinate(&options.coordinate)
+        .and_then(|coordinate| {
+            let catalog = catalog::Catalog::parse(&options.catalog)?;
+            let digest = catalog::resolve(&catalog, &coordinate, options.timeout)?;
+            Ok(format!(
+                "{}/{}@sha256:{digest}",
+                coordinate.issuer, coordinate.name
+            ))
+        })
+        // The node's own parser has the last word, so a reference this command
+        // prints is one a node would accept — including the issuer and name
+        // rules `catalog` deliberately does not restate.
+        .and_then(|reference| {
+            imageless::ReleaseReference::parse(&reference)
+                .map(|_| reference)
+                .map_err(|error| error.to_string())
+        });
+    match resolved {
+        Ok(reference) => {
+            println!("{reference}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
+    }
+}
 
 #[cfg_attr(test, derive(Debug))]
 enum ParsedDoctor {
