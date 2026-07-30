@@ -181,6 +181,17 @@ const DOCTOR_USAGE: &str = "kubectl imageless doctor — report whether a cluste
      \n\
      Exit: 0 healthy, 1 a check failed, 2 usage, 3 the cluster could not be probed.";
 
+/// Bound on a channel-pointer fetch, in seconds.
+///
+/// `pin` exposes this as `--timeout-seconds` because it is the command a
+/// release pipeline puts in a loop, where a catalog that hangs would hang the
+/// pipeline. `run --release` takes the default and offers no knob: it is
+/// already the long-running command of the two — it packs or pushes an image
+/// after this — so a second timeout dial there would be tuning the fastest step
+/// of a slow operation. Anyone who needs the knob can `pin` and pass the
+/// resulting reference.
+const POINTER_TIMEOUT_SECONDS: u64 = 10;
+
 #[cfg_attr(test, derive(Debug))]
 enum ParsedPin {
     Help,
@@ -197,7 +208,7 @@ struct PinOptions {
 fn parse_pin(arguments: &[String]) -> Result<ParsedPin, String> {
     let mut coordinate = None;
     let mut catalog = None;
-    let mut timeout = 10u64;
+    let mut timeout = POINTER_TIMEOUT_SECONDS;
 
     let mut iterator = arguments.iter();
     while let Some(argument) = iterator.next() {
@@ -627,7 +638,11 @@ fn run_release(options: &RunOptions, coordinate: &str) -> ExitCode {
         .expect("release mode requires --catalog");
     let pinned = catalog::parse_coordinate(coordinate).and_then(|coordinate| {
         let catalog = catalog::Catalog::parse(catalog_source)?;
-        let digest = catalog::resolve(&catalog, &coordinate, std::time::Duration::from_secs(10))?;
+        let digest = catalog::resolve(
+            &catalog,
+            &coordinate,
+            std::time::Duration::from_secs(POINTER_TIMEOUT_SECONDS),
+        )?;
         let reference = format!("{}/{}@sha256:{digest}", coordinate.issuer, coordinate.name);
         // The node's parser has the last word, exactly as in `pin`.
         imageless::ReleaseReference::parse(&reference)
