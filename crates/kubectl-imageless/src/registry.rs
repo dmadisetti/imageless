@@ -391,7 +391,7 @@ enum Method {
 
 /// Registry-supplied text reaches a terminal, so control characters — escape
 /// sequences that could rewrite what the user sees — never survive.
-fn printable(raw: &str) -> String {
+pub(crate) fn printable(raw: &str) -> String {
     raw.chars()
         .map(|character| {
             if character == '\n' || character == '\t' {
