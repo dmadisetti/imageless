@@ -45,16 +45,19 @@ of arriving alongside the core the way they did in the incubation repo.
       invalidate the claim.
 - [ ] Publish the `imageless` crate once the `prepare_bundle`-shaped API
       settles.
-- [ ] **`kubectl-imageless` plugin — zero Nix on the client.**
+- [x] **`kubectl-imageless` plugin — zero Nix on the client.**
       `kubectl imageless run ./dir` packs the directory into a seed-image
       layer at `/etc/imageless/` (plain tar + manifest — no Nix, no Docker),
-      pushes to a configured registry, and applies a Pod with
-      `runtimeClassName: imageless`; `kubectl imageless run <flake-ref>`
-      deploys the external-ref mode instead (annotation only, needs node
-      policy allow-listing). Client-side enforcement of the spec's staging
-      bounds, a loud warning on missing `flake.lock`, and a `doctor`
-      subcommand that diagnoses unprepared clusters. Evaluation happens on
-      the node, under node policy — the client stays Nix-free.
+      pushes to a configured registry, and prints a digest-pinned Pod with
+      `runtimeClassName: imageless`; `kubectl imageless run --external
+      <flake-ref>` deploys the external-ref mode instead (annotation only,
+      needs node policy allow-listing, and refuses an unpinned reference the
+      node deliberately would not). Client-side enforcement of the spec's
+      staging bounds, a loud warning on missing `flake.lock`, and a `doctor`
+      subcommand that diagnoses unprepared clusters — including the two
+      offline checks, policy and reference, that need no cluster at all.
+      Evaluation happens on the node, under node policy — the client stays
+      Nix-free.
 - [ ] Documented dev-cluster quickstart (kind/k3d) so the plugin has a
       five-minute path from nothing to a running flake.
 - [ ] **No hand-typed digests.** Optional catalog name/channel index

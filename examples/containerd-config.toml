@@ -11,9 +11,17 @@ version = 3
   runtime_type = "io.containerd.runc.v2"
 
   # Copy only the generic production contract onto the OCI spec. Add
-  # "run.imageless.*" only on nodes that explicitly enable the unprivileged
-  # development-source worker. Application runtimes may add their own separate
-  # annotation namespace without changing imageless.
+  # "run.imageless.*" to BOTH lists on nodes that enable development sources —
+  # an embedded flake's output/container selectors, and the external flake
+  # references `kubectl imageless run --external` emits. One list is not
+  # enough: these are two separate filters, and the workload container's spec
+  # — the only one materialization reads, since a sandbox is never
+  # materialized — is populated from container_annotations.
+  # A dropped annotation is not silent — the placeholder image such a pod is
+  # created from fails the create saying so — but it is a create failure, so
+  # widen these before deploying an external reference, not after. Application
+  # runtimes may add their own separate annotation namespace without changing
+  # imageless.
   pod_annotations = ["imageless.run/*"]
   container_annotations = ["imageless.run/*"]
 

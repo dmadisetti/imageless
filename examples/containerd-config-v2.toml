@@ -3,6 +3,9 @@ version = 2
 
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.imageless]
   runtime_type = "io.containerd.runc.v2"
+  # Production contract only; see containerd-config.toml for why nodes that
+  # accept development sources or external flake references need
+  # "run.imageless.*" added to both of these lists rather than just one.
   pod_annotations = ["imageless.run/*"]
   container_annotations = ["imageless.run/*"]
 

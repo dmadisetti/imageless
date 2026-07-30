@@ -8,6 +8,13 @@
 # is not a deployment identity: pin with a revision (`/COMMIT` or `?rev=`) or a
 # content hash (`?narHash=`). The referenced flake's committed flake.lock is
 # honored as written; inputs it left unlocked still resolve at evaluation time.
+#
+# `kubectl imageless run --external <flake-ref> --repo HOST/REPO` writes this
+# manifest for you, and refuses an unpinned reference before it pushes
+# anything. The placeholder below is whatever it pushed (or `--image`'s
+# argument); the pinned image imageless emits carries a flake that throws, so a
+# node whose containerd handler filtered `run.imageless.*` out of the spec
+# fails the create with that diagnosis instead of running an empty container.
 apiVersion: v1
 kind: Pod
 metadata:
