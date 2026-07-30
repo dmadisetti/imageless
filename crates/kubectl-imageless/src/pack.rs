@@ -225,19 +225,22 @@ fn read_regular(path: &Path, budget: &mut Budget) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
+/// The one ustar writer in the plugin. `placeholder` builds its layer with
+/// this too, so the determinism rules above — and the golden digest test that
+/// guards them — cover every layer the plugin can push.
 #[derive(Default)]
-struct LayerWriter {
-    tar: Vec<u8>,
+pub(crate) struct LayerWriter {
+    pub(crate) tar: Vec<u8>,
 }
 
 impl LayerWriter {
-    fn directory(&mut self, path: &str) -> Result<(), String> {
+    pub(crate) fn directory(&mut self, path: &str) -> Result<(), String> {
         let header = header(&format!("{path}/"), 0o755, 0, b'5')?;
         self.tar.extend_from_slice(&header);
         Ok(())
     }
 
-    fn file(&mut self, path: &str, mode: u32, data: &[u8]) -> Result<(), String> {
+    pub(crate) fn file(&mut self, path: &str, mode: u32, data: &[u8]) -> Result<(), String> {
         let header = header(path, mode, data.len() as u64, b'0')?;
         self.tar.extend_from_slice(&header);
         self.tar.extend_from_slice(data);
@@ -246,7 +249,7 @@ impl LayerWriter {
         Ok(())
     }
 
-    fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) {
         self.tar.extend_from_slice(&[0; 2 * BLOCK]);
     }
 }

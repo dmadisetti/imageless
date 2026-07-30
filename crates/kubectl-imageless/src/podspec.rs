@@ -4,14 +4,14 @@
 //! anything is printed, so a selection the node would reject is rejected at
 //! authoring time with the node's own error text.
 
-use imageless::{plan, OUTPUT_ANNOTATION, SOURCE_ANNOTATION};
+use imageless::{plan, Materialize, OUTPUT_ANNOTATION, SOURCE_ANNOTATION};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 
 /// The source the node's zero-config discovery synthesizes for an embedded
 /// flake; written explicitly so the pod manifest is self-describing.
-const EMBEDDED_SOURCE: &str = "/etc/imageless";
+pub const EMBEDDED_SOURCE: &str = "/etc/imageless";
 
 pub struct PodSpec<'a> {
     pub name: &'a str,
@@ -19,11 +19,15 @@ pub struct PodSpec<'a> {
     /// Digest-pinned reference: `HOST/REPO@sha256:<manifest-digest>`.
     pub image: &'a str,
     pub runtime_class: &'a str,
+    /// What the node materializes: `EMBEDDED_SOURCE` for a packed seed, or an
+    /// external flake reference. `plan` below decides whether it is admissible
+    /// at all, so this field carries no grammar of its own.
+    pub source: &'a str,
     pub output: Option<&'a str>,
     pub command: &'a [String],
 }
 
-pub fn seed_pod(spec: &PodSpec) -> Result<Value, String> {
+pub fn pod(spec: &PodSpec) -> Result<Value, String> {
     if spec.command.is_empty() {
         return Err(
             "a workload command is required (the materialized rootfs chooses its own layout, \
@@ -32,12 +36,18 @@ pub fn seed_pod(spec: &PodSpec) -> Result<Value, String> {
         );
     }
     validate_name(spec.name)?;
-    let mut annotations =
-        HashMap::from([(SOURCE_ANNOTATION.to_string(), EMBEDDED_SOURCE.to_string())]);
+    let mut annotations = HashMap::from([(SOURCE_ANNOTATION.to_string(), spec.source.to_string())]);
     if let Some(output) = spec.output {
         annotations.insert(OUTPUT_ANNOTATION.to_string(), output.to_string());
     }
-    plan(&annotations, Path::new("/"), "rootfs").map_err(|error| error.to_string())?;
+    // A plan of `None` means the node would decline to materialize this pod at
+    // all — today unreachable, since nothing here emits a container selector,
+    // but printing a pod the runtime silently ignores is the one failure this
+    // command must never produce.
+    let materialize = plan(&annotations, Path::new("/"), "rootfs")
+        .map_err(|error| error.to_string())?
+        .ok_or("the annotations select no container to materialize")?;
+    debug_assert!(matches!(materialize, Materialize::Flake(_)));
 
     let mut metadata = json!({
         "name": spec.name,
@@ -92,6 +102,15 @@ pub fn derive_name(directory: &Path) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default();
+    sanitize_name(&raw)
+}
+
+/// Coerce arbitrary text into the RFC 1123 label [`validate_name`] accepts,
+/// falling back to `imageless-run` when nothing usable survives. Shared with
+/// `flakeref`, so a name derived from a flake reference and one derived from a
+/// directory cannot disagree about what a legal pod name is.
+pub fn sanitize_name(raw: &str) -> String {
+    let raw = raw.to_lowercase();
     let mut name = String::new();
     for character in raw.chars() {
         if character.is_ascii_lowercase() || character.is_ascii_digit() {
@@ -119,6 +138,7 @@ mod tests {
             namespace: None,
             image: "registry.example/apps/demo@sha256:0000",
             runtime_class: "imageless",
+            source: EMBEDDED_SOURCE,
             output: None,
             command,
         }
@@ -127,7 +147,7 @@ mod tests {
     #[test]
     fn the_manifest_selects_the_embedded_source() {
         let command = vec!["/bin/server".to_string(), "--port=8080".to_string()];
-        let pod = seed_pod(&spec(&command)).unwrap();
+        let pod = pod(&spec(&command)).unwrap();
         assert_eq!(
             pod["metadata"]["annotations"][SOURCE_ANNOTATION],
             EMBEDDED_SOURCE
@@ -140,16 +160,16 @@ mod tests {
 
     #[test]
     fn a_missing_command_fails_at_authoring_time() {
-        let error = seed_pod(&spec(&[])).unwrap_err();
+        let error = pod(&spec(&[])).unwrap_err();
         assert!(error.contains("command is required"), "{error}");
     }
 
     #[test]
     fn an_invalid_output_fails_with_the_node_s_error_text() {
         let command = vec!["/bin/true".to_string()];
-        let mut pod = spec(&command);
-        pod.output = Some("has whitespace here");
-        let error = seed_pod(&pod).unwrap_err();
+        let mut with_output = spec(&command);
+        with_output.output = Some("has whitespace here");
+        let error = pod(&with_output).unwrap_err();
         assert!(error.contains(OUTPUT_ANNOTATION), "{error}");
     }
 
@@ -158,8 +178,8 @@ mod tests {
         let command = vec!["/bin/true".to_string()];
         let mut with = spec(&command);
         with.namespace = Some("staging");
-        assert_eq!(seed_pod(&with).unwrap()["metadata"]["namespace"], "staging");
-        assert!(seed_pod(&spec(&command)).unwrap()["metadata"]["namespace"].is_null());
+        assert_eq!(pod(&with).unwrap()["metadata"]["namespace"], "staging");
+        assert!(pod(&spec(&command)).unwrap()["metadata"]["namespace"].is_null());
     }
 
     #[test]
