@@ -150,19 +150,49 @@ fn main() {
         let mut prepare = PrepareBundle::new(bundle.join("config.json"), bundle);
         prepare.default_output = default_output();
         prepare.timeout_seconds = timeout_seconds().unwrap_or_else(|error| fail(error, 1));
-        let resolution = prepare_bundle(&prepare)
-            .unwrap_or_else(|error| fail(format_args!("bundle selection failed: {error}"), 1));
+        let prepare_started = Instant::now();
+        let resolution = prepare_bundle(&prepare).unwrap_or_else(|error| {
+            // The sink recorded successes only: every failure exited here,
+            // before the export below. A node that never starts a pod is
+            // exactly the node an operator needs a record from, and the
+            // duration is the useful half — it separates a fast refusal
+            // (policy, a contract error) from a create that burned its whole
+            // deadline. No release identity exists yet, so the event is named
+            // for the stage rather than for a release never selected.
+            if let Some(path) = nonempty(TELEMETRY_ENV) {
+                let _ = export_timing_events(
+                    Path::new(&path),
+                    "unresolved",
+                    &[("preparation", elapsed_us(prepare_started))],
+                    Some("error"),
+                );
+            }
+            // "selection" named one stage of several: a substitution timeout
+            // read as a selection problem. Nothing in the tree or in CI greps
+            // this string.
+            fail(format_args!("bundle preparation failed: {error}"), 1)
+        });
         if let Some(resolution) = resolution {
             if let Some(path) = nonempty(TELEMETRY_ENV) {
                 let timings = &resolution.timings;
                 let _ = export_timing_events(
                     Path::new(&path),
                     &resolution.resolution.identity,
+                    // The four original stages keep their names, their order,
+                    // and their spans; the rest are carved out of two of them,
+                    // so `selection + policy_verification + substitution +
+                    // rewrite` still totals the create and the finer stages
+                    // explain where two of those went rather than adding to
+                    // them. Anything summing these must pick one set.
                     &[
                         ("selection", timings.selection_us),
                         ("policy_verification", timings.policy_verification_us),
                         ("substitution", timings.substitution_us),
                         ("rewrite", timings.rewrite_us),
+                        ("manifest_fetch", timings.manifest_fetch_us),
+                        ("staging", timings.staging_us),
+                        ("evaluation", timings.evaluation_us),
+                        ("root_registration", timings.root_registration_us),
                     ],
                     Some("success"),
                 );

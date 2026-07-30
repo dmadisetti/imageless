@@ -16,6 +16,7 @@ use crate::{
     MAX_STAGED_SOURCE_BYTES, MAX_STAGED_SOURCE_ENTRIES, PROTOCOL_VERSION,
 };
 use serde::Deserialize;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::fs::OpenOptions;
@@ -255,6 +256,35 @@ struct ResolverInner {
     permit_ready: Condvar,
 }
 
+/// Sub-stage durations accumulated over one caller's resolution.
+///
+/// `Cell` rather than return values: these spans are taken at four different
+/// depths of the materialize call tree, and handing tuples back up would put a
+/// timing field in the signature of every function they pass through. One
+/// caller owns one clock for the length of its own resolution and no other
+/// thread touches it, so there is nothing here to synchronize — a follower on a
+/// coalesced flight has its own clock and records only the root registration it
+/// actually performed.
+#[derive(Default)]
+struct StageClock {
+    manifest_fetch_us: Cell<u64>,
+    staging_us: Cell<u64>,
+    evaluation_us: Cell<u64>,
+    root_registration_us: Cell<u64>,
+}
+
+impl StageClock {
+    /// Run `call`, adding its duration to `field`. Additive because a single
+    /// resolution can enter the same stage twice — a release with mounts
+    /// realises more than one store path.
+    fn time<T>(field: &Cell<u64>, call: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let value = call();
+        field.set(field.get().saturating_add(elapsed_us(started)));
+        value
+    }
+}
+
 struct Flight {
     state: Mutex<FlightState>,
     ready: Condvar,
@@ -307,6 +337,7 @@ impl Resolver {
         // subsequent Nix work is single-flighted by immutable release identity,
         // but a concurrent prewarm or differently named container must never
         // lend its selector decision to another request.
+        let clock = StageClock::default();
         let policy_started = Instant::now();
         let selected = match &request.materialize {
             Materialize::Release(reference) => Some(self.select_release(
@@ -314,6 +345,7 @@ impl Resolver {
                 request.container_name.as_deref(),
                 request.purpose,
                 deadline,
+                &clock,
             )?),
             _ => None,
         };
@@ -340,15 +372,20 @@ impl Resolver {
         };
 
         let result = if leader {
-            let result =
-                self.materialize(&request.materialize, selected.as_ref(), &bundle, deadline);
+            let result = self.materialize(
+                &request.materialize,
+                selected.as_ref(),
+                &bundle,
+                deadline,
+                &clock,
+            );
             let mut state = flight.state.lock().unwrap();
             state.result = Some(result.clone());
             flight.ready.notify_all();
             result
         } else {
             match wait_for_flight(&flight, deadline) {
-                Ok(resolution) => self.register_resolution(&resolution, &bundle, deadline),
+                Ok(resolution) => self.register_resolution(&resolution, &bundle, deadline, &clock),
                 Err(error) => Err(error),
             }
         };
@@ -360,8 +397,15 @@ impl Resolver {
         result.map(|resolution| ResolutionSuccess {
             resolution,
             timings: ResolutionTimings {
+                // The outer spans keep their original boundaries so the numbers
+                // stay comparable across this change; the fields below are
+                // carved out of them rather than added beside them.
                 policy_verification_us,
                 substitution_us: elapsed_us(substitution_started),
+                manifest_fetch_us: clock.manifest_fetch_us.get(),
+                staging_us: clock.staging_us.get(),
+                evaluation_us: clock.evaluation_us.get(),
+                root_registration_us: clock.root_registration_us.get(),
             },
         })
     }
@@ -385,8 +429,10 @@ impl Resolver {
                 false,
             ));
         };
+        let clock = StageClock::default();
         let policy_started = Instant::now();
-        let selected = self.select_release(reference, None, ResolvePurpose::Inspect, deadline)?;
+        let selected =
+            self.select_release(reference, None, ResolvePurpose::Inspect, deadline, &clock)?;
         let policy_verification_us = elapsed_us(policy_started);
         let substitution_started = Instant::now();
         let closure = self.query_closure(&selected, deadline)?;
@@ -395,6 +441,10 @@ impl Resolver {
             timings: ResolutionTimings {
                 policy_verification_us,
                 substitution_us: elapsed_us(substitution_started),
+                manifest_fetch_us: clock.manifest_fetch_us.get(),
+                // Inspection stages nothing, evaluates nothing, and registers no
+                // root: it answers what a release would cost, without paying it.
+                ..ResolutionTimings::default()
             },
         };
         Ok((success, closure))
@@ -537,6 +587,7 @@ impl Resolver {
         selected: Option<&SelectedRelease>,
         bundle: &Path,
         deadline: Instant,
+        clock: &StageClock,
     ) -> Result<ResolvedRelease, ResolutionError> {
         if matches!(materialize, Materialize::Release(_)) {
             let selected = selected.ok_or_else(|| {
@@ -546,10 +597,10 @@ impl Resolver {
                     false,
                 )
             })?;
-            return self.materialize_release(selected, bundle, deadline);
+            return self.materialize_release(selected, bundle, deadline, clock);
         }
         if let Materialize::Flake(installable) = materialize {
-            return self.materialize_development(installable, bundle, deadline);
+            return self.materialize_development(installable, bundle, deadline, clock);
         }
         let root = bundle.join(GC_ROOT_NAME);
         prepare_gc_root(&root)?;
@@ -564,15 +615,16 @@ impl Resolver {
             Materialize::Flake(_) => unreachable!(),
             Materialize::Release(_) => unreachable!(),
         };
-        let stdout = run_command(&mut command, remaining(deadline, "during materialization")?)
+        let budget = remaining(deadline, "during materialization")?;
+        let stdout = StageClock::time(&clock.evaluation_us, || run_command(&mut command, budget))
             .map_err(|error| match error.kind() {
-                io::ErrorKind::TimedOut => ResolutionError::timeout("during materialization"),
-                _ => ResolutionError::new(
-                    ErrorCategory::Materialization,
-                    format!("Nix could not materialize the requested rootfs: {error}"),
-                    true,
-                ),
-            })?;
+            io::ErrorKind::TimedOut => ResolutionError::timeout("during materialization"),
+            _ => ResolutionError::new(
+                ErrorCategory::Materialization,
+                format!("Nix could not materialize the requested rootfs: {error}"),
+                true,
+            ),
+        })?;
         let store_path = match materialize {
             Materialize::Closure(store_path) => store_path,
             Materialize::Flake(_) | Materialize::Release(_) => unreachable!(),
@@ -601,6 +653,7 @@ impl Resolver {
         installable: &str,
         bundle: &Path,
         deadline: Instant,
+        clock: &StageClock,
     ) -> Result<ResolvedRelease, ResolutionError> {
         let worker = self.inner.config.development_worker.as_ref();
         if worker.is_none() && !self.inner.config.evaluate_as_caller {
@@ -612,11 +665,13 @@ impl Resolver {
         }
         let root = bundle.join(GC_ROOT_NAME);
         prepare_gc_root(&root)?;
-        let staged = stage_development_installable(
-            installable,
-            worker.map(|worker| worker.user.as_str()),
-            deadline,
-        )?;
+        let staged = StageClock::time(&clock.staging_us, || {
+            stage_development_installable(
+                installable,
+                worker.map(|worker| worker.user.as_str()),
+                deadline,
+            )
+        })?;
         let evaluation_installable = staged
             .as_ref()
             .map(|(installable, _guard)| installable.as_str())
@@ -663,20 +718,19 @@ impl Resolver {
                     command
                 }
             };
-            run_command(
-                &mut command,
-                remaining(deadline, "during development source evaluation")?,
-            )
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::TimedOut => {
-                    ResolutionError::timeout("during development source evaluation")
-                }
-                _ => ResolutionError::new(
-                    ErrorCategory::Materialization,
-                    format!("the development resolver could not evaluate the source: {error}"),
-                    true,
-                ),
-            })?
+            let budget = remaining(deadline, "during development source evaluation")?;
+            StageClock::time(&clock.evaluation_us, || run_command(&mut command, budget)).map_err(
+                |error| match error.kind() {
+                    io::ErrorKind::TimedOut => {
+                        ResolutionError::timeout("during development source evaluation")
+                    }
+                    _ => ResolutionError::new(
+                        ErrorCategory::Materialization,
+                        format!("the development resolver could not evaluate the source: {error}"),
+                        true,
+                    ),
+                },
+            )?
         };
         let store_path = parse_materialized_path(&stdout).map_err(|_| {
             ResolutionError::new(
@@ -685,7 +739,9 @@ impl Resolver {
                 false,
             )
         })?;
-        self.register_root(&store_path, &root, deadline)?;
+        StageClock::time(&clock.root_registration_us, || {
+            self.register_root(&store_path, &root, deadline)
+        })?;
         Ok(ResolvedRelease {
             identity: development_identity(installable),
             rootfs: store_path,
@@ -700,6 +756,7 @@ impl Resolver {
         container_name: Option<&str>,
         purpose: ResolvePurpose,
         deadline: Instant,
+        clock: &StageClock,
     ) -> Result<SelectedRelease, ResolutionError> {
         let issuer = self
             .inner
@@ -721,11 +778,17 @@ impl Resolver {
                 false,
             ));
         }
-        let bytes = release::fetch_manifest(
-            &issuer.source,
-            &reference.sha256,
-            remaining(deadline, "while fetching the release manifest")?,
-        )?;
+        // A network round trip on an HTTPS issuer, and the reason
+        // `policy_verification_us` used to grow with catalog latency: it spans
+        // this call, so a slow catalog was indistinguishable from a slow policy
+        // check.
+        let bytes = StageClock::time(&clock.manifest_fetch_us, || {
+            release::fetch_manifest(
+                &issuer.source,
+                &reference.sha256,
+                remaining(deadline, "while fetching the release manifest")?,
+            )
+        })?;
         let manifest = release::parse_full_manifest(&bytes, reference)?;
         if purpose == ResolvePurpose::Runtime && !manifest.selectors.permits(container_name) {
             return Err(ResolutionError::new(
@@ -798,11 +861,16 @@ impl Resolver {
         selected: &SelectedRelease,
         bundle: &Path,
         deadline: Instant,
+        clock: &StageClock,
     ) -> Result<ResolvedRelease, ResolutionError> {
         for (index, store_path) in selected.resolution.store_paths().enumerate() {
             let root = gc_root_path(bundle, index)?;
             prepare_gc_root(&root)?;
-            self.materialize_store_path(store_path, &root, &selected.cache, deadline)?;
+            // A release with mounts realises more than one path, which is why
+            // the clock accumulates rather than assigns.
+            StageClock::time(&clock.evaluation_us, || {
+                self.materialize_store_path(store_path, &root, &selected.cache, deadline)
+            })?;
         }
         Ok(selected.resolution.clone())
     }
@@ -1026,11 +1094,17 @@ impl Resolver {
         resolution: &ResolvedRelease,
         bundle: &Path,
         deadline: Instant,
+        clock: &StageClock,
     ) -> Result<ResolvedRelease, ResolutionError> {
         for (index, store_path) in resolution.store_paths().enumerate() {
             let root = gc_root_path(bundle, index)?;
             prepare_gc_root(&root)?;
-            self.register_root(store_path, &root, deadline)?;
+            // A follower reaching here paid no staging and no evaluation — the
+            // leader did — so this is the whole of its materialization cost,
+            // and the gap between it and `substitution_us` is the wait.
+            StageClock::time(&clock.root_registration_us, || {
+                self.register_root(store_path, &root, deadline)
+            })?;
         }
         Ok(resolution.clone())
     }

@@ -368,10 +368,38 @@ Operator-facing:
 | `IMAGELESS_STORE_PROJECTION` | unset (`node`) | `closure` binds only the selected release's closure, one read-only mount per store path — the hardened backend. Any other value keeps the whole-node `/nix/store` bind. |
 | `IMAGELESS_REALIZATION_TIMEOUT_SECONDS` | `300` | Wall-clock bound on materialization, 1–3600. Out-of-range or non-integer values fail the create. |
 | `IMAGELESS_DEFAULT_OUTPUT` | `rootfs` | Flake output used when the image carries no `run.imageless.output` annotation. |
-| `IMAGELESS_TELEMETRY_PATH` | unset | Append per-phase timing events (selection, policy verification, substitution, rewrite, delegate startup) as ndjson to this file. Unset disables telemetry; write failures are ignored and never fail a create. |
+| `IMAGELESS_TELEMETRY_PATH` | unset | Append per-phase timing events as ndjson to this file. Unset disables telemetry; write failures are ignored and never fail a create. See below for the stages. |
 | `IMAGELESS_RUNC` | the stock `runc` baked in at build time (`runc` on PATH for an unbaked build) | The real OCI runtime to delegate to after the rewrite. Set this if you install `imageless-runc` *as* `runc`, so delegation cannot recurse through `PATH`. |
 | `IMAGELESS_NIX` / `IMAGELESS_NIX_STORE` | baked at build time (`nix` / `nix-store` on PATH for an unbaked build) | The `nix` and `nix-store` binaries the materializer drives, in-process and in the daemon. `IMAGELESS_NIX_STORE` is also used for closure enumeration under `IMAGELESS_STORE_PROJECTION=closure`. |
 | `IMAGELESS_SYSTEM` | `x86_64-linux` | Nix system double for the synthesized fail-closed default policy. A loaded policy file carries its own `system` and wins, so this only matters when no policy file exists. |
+
+Each create appends one `imageless.timing.v1` event per stage, carrying the
+release identity, the duration, and an outcome of `success` or `error`. The
+stages come in two sets, and **anything summing them must pick one**:
+
+| Stage | Meaning |
+|---|---|
+| `selection` | Reading `config.json` and deciding what, if anything, to materialize. |
+| `policy_verification` | Authorizing the release against node policy — *and* fetching its manifest. |
+| `substitution` | Everything from the end of selection to a materialized rootfs. |
+| `rewrite` | Applying the result to the OCI spec. |
+| `delegate_startup` | Handing off to the real runtime. |
+
+Those five span the create end to end. The rest are *carved out of two of
+them* — they explain where `policy_verification` and `substitution` went rather
+than adding to them:
+
+| Stage | Carved out of | Meaning |
+|---|---|---|
+| `manifest_fetch` | `policy_verification` | Fetching the release manifest: a network round trip on an HTTPS issuer. A slow catalog used to be indistinguishable from a slow policy check. |
+| `staging` | `substitution` | Copying an embedded development source out of the image. Zero for a release, and for an external reference evaluated where it stands. |
+| `evaluation` | `substitution` | The Nix process itself. The field most likely to explain a create that spent minutes. |
+| `root_registration` | `substitution` | Registering the GC root. For a create that joined another's in-flight materialization, this is the whole of its own Nix cost, and the gap to `substitution` is what it spent waiting. |
+
+A create that *fails* now appends a single `preparation` event with outcome
+`error` and no release identity — there is none yet — where it previously
+recorded nothing at all. The duration separates a fast refusal, like a policy
+denial, from a create that burned its whole deadline.
 
 Client-side, read only by `kubectl-imageless`:
 

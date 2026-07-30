@@ -516,26 +516,99 @@ fn annotated_create_applies_release_metadata_roots_and_telemetry() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(events.len(), 5);
+    assert_eq!(events.len(), 9);
     assert_eq!(
         events
             .iter()
             .map(|event| event["stage"].as_str().unwrap())
             .collect::<Vec<_>>(),
         [
+            // The original four, unchanged in name, order and span.
             "selection",
             "policy_verification",
             "substitution",
             "rewrite",
+            // Carved out of two of the above rather than added beside them.
+            "manifest_fetch",
+            "staging",
+            "evaluation",
+            "root_registration",
             "delegate_startup"
         ]
     );
+    let stage = |name: &str| {
+        events
+            .iter()
+            .find(|event| event["stage"] == name)
+            .map(|event| event["duration_us"].as_u64().unwrap())
+            .unwrap()
+    };
+    // The defect this split exists to fix: the manifest fetch is inside the
+    // policy span, so a slow catalog used to read as a slow policy check.
+    assert!(
+        stage("manifest_fetch") <= stage("policy_verification"),
+        "the manifest fetch is carved out of policy verification, not added to it"
+    );
+    // This release is materialized, not staged: staging is for embedded
+    // development sources only.
+    assert_eq!(stage("staging"), 0);
+    assert!(stage("evaluation") <= stage("substitution"));
     assert!(events.iter().all(|event| {
         event["schema"] == "imageless.timing.v1"
             && event["release"] == release.reference
             && event["outcome"] == "success"
             && event["duration_us"].is_u64()
     }));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_failed_create_records_an_error_event_where_it_previously_recorded_nothing() {
+    // The sink held successes only, because every failure exited the shim
+    // before the export. A node that never starts a pod is the one an operator
+    // most needs a record from.
+    let dir = temp_dir("failed-telemetry");
+    let release = TestRelease::new(&dir);
+    let bundle = dir.join("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+    // An issuer node policy does not allow: refused during selection, so the
+    // failure lands before any release identity exists to name the event for.
+    write_config(
+        &bundle,
+        serde_json::json!({
+            "imageless.run/release-v1": release.reference.replacen("test/", "other/", 1)
+        }),
+    );
+    let nix = dir.join("nix");
+    fake_nix(&nix, "true");
+    let delegate = dir.join("delegate");
+    let called = dir.join("called");
+    executable(&delegate, "touch \"$CALLED\"");
+    let telemetry = dir.join("timings.jsonl");
+    let resolver = ResolverProcess::start(&dir, &nix, &release.policy);
+    let output = runc(&bundle, &delegate, &resolver.socket)
+        .env("IMAGELESS_TELEMETRY_PATH", &telemetry)
+        .env("CALLED", &called)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!called.exists(), "a refused create must not reach runc");
+
+    let events = std::fs::read_to_string(telemetry)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["schema"], "imageless.timing.v1");
+    assert_eq!(events[0]["outcome"], "error");
+    assert_eq!(events[0]["stage"], "preparation");
+    // No release was selected, so naming one would be a claim the run cannot
+    // support.
+    assert_eq!(events[0]["release"], "unresolved");
+    // The duration is the half that distinguishes a fast refusal from a create
+    // that burned its whole deadline.
+    assert!(events[0]["duration_us"].is_u64());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
