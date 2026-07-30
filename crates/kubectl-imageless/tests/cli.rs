@@ -172,3 +172,65 @@ fn requested_help_lands_on_stdout_and_succeeds() {
         assert!(stdout.contains("Usage:"), "{arguments:?}: {stdout}");
     }
 }
+
+/// A catalog whose `refs/agent/stable` names `DIGEST`.
+fn catalog(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "kubectl-imageless-catalog-cli-{label}-{}",
+        std::process::id()
+    ));
+    let channels = root.join("refs/agent");
+    std::fs::create_dir_all(&channels).unwrap();
+    std::fs::write(channels.join("stable"), format!("{DIGEST}\n")).unwrap();
+    root
+}
+
+const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn pin_prints_only_the_pinned_reference_so_it_composes() {
+    let root = catalog("compose");
+    let output = binary()
+        .args(["pin", "example/agent", "--catalog"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Exactly the reference and a newline: this is what gets substituted into a
+    // manifest, so anything else on stdout would corrupt it.
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("example/agent@sha256:{DIGEST}\n")
+    );
+    assert!(String::from_utf8(output.stderr).unwrap().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_mistyped_channel_lists_the_ones_that_exist() {
+    let root = catalog("mistyped");
+    let output = binary()
+        .args(["pin", "example/agent:nightly", "--catalog"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("not published"), "{stderr}");
+    assert!(stderr.contains("stable"), "{stderr}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pin_without_a_catalog_is_a_usage_error_not_a_guess() {
+    // There is no node policy on a client to read an issuer's catalog from,
+    // and guessing one would resolve against a catalog nobody named.
+    let output = binary().args(["pin", "example/agent"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--catalog is required"), "{stderr}");
+}
