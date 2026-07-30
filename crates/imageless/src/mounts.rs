@@ -255,7 +255,7 @@ pub(crate) fn normalized_oci_destination(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::bundle::apply_resolution_with_projection;
-    use crate::testutil::{executable, temporary, STORE};
+    use crate::testutil::{executable, temporary, without_text_file_busy, STORE};
 
     #[test]
     fn enumerate_closure_returns_sorted_unique_store_paths_and_fails_closed() {
@@ -270,7 +270,7 @@ printf '%s\n' "/nix/store/22222222222222222222222222222222-bash"
 printf '%s\n' "/nix/store/11111111111111111111111111111111-libc"
 printf '%s\n' "/nix/store/11111111111111111111111111111111-libc""#,
         );
-        let closure = enumerate_closure(&nix, &[STORE]).unwrap();
+        let closure = without_text_file_busy(|| enumerate_closure(&nix, &[STORE])).unwrap();
         assert_eq!(
             closure,
             vec![
@@ -284,13 +284,13 @@ printf '%s\n' "/nix/store/11111111111111111111111111111111-libc""#,
         // an arbitrary bind source.
         let bad = dir.join("fake-nix-store-bad");
         executable(&bad, r#"printf '%s\n' "/etc/passwd""#);
-        let error = enumerate_closure(&bad, &[STORE]).unwrap_err();
+        let error = without_text_file_busy(|| enumerate_closure(&bad, &[STORE])).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         // A nonzero exit is surfaced, not silently treated as an empty closure.
         let fail = dir.join("fake-nix-store-fail");
         executable(&fail, "echo boom >&2\nexit 3");
-        assert!(enumerate_closure(&fail, &[STORE]).is_err());
+        assert!(without_text_file_busy(|| enumerate_closure(&fail, &[STORE])).is_err());
 
         std::fs::remove_dir_all(dir).unwrap();
     }

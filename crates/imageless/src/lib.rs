@@ -145,6 +145,26 @@ pub(crate) mod testutil {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Retry a call that execs a script this test just wrote.
+    ///
+    /// A sibling test thread forking while our write descriptor is open leaves
+    /// its child holding that descriptor, and execve then refuses the script
+    /// with ETXTBSY. Nothing the writer can do closes the window — the fork
+    /// belongs to another thread — so retrying the call is the only fix
+    /// available to a test that writes its own executable. Only ETXTBSY is
+    /// retried: every other error is the answer under test.
+    pub(crate) fn without_text_file_busy<T>(
+        mut call: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        for _ in 0..8 {
+            match call() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => continue,
+                result => return result,
+            }
+        }
+        call()
+    }
+
     pub(crate) fn fake_nix(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("fake-nix");
         executable(
