@@ -15,3 +15,5 @@ serde_json = { workspace = true }
 libc = "0.2"
 sha2 = "0.10"
 hex = "0.4"
+ureq = { workspace = true }
+base64 = "0.22"
