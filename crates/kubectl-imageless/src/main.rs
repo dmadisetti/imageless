@@ -13,7 +13,9 @@
 //! contents.
 
 mod auth;
+mod doctor;
 mod flakeref;
+mod kubectl;
 mod oci;
 mod pack;
 mod placeholder;
@@ -32,6 +34,18 @@ fn main() -> ExitCode {
             Err(error) => {
                 eprintln!("kubectl-imageless: {error}\n");
                 usage()
+            }
+        },
+        Some("doctor") => match parse_doctor(&arguments[1..]) {
+            Ok(ParsedDoctor::Help) => {
+                println!("{DOCTOR_USAGE}");
+                ExitCode::SUCCESS
+            }
+            Ok(ParsedDoctor::Doctor(options)) => doctor::run(&options),
+            Err(error) => {
+                eprintln!("kubectl-imageless: {error}\n");
+                eprintln!("{DOCTOR_USAGE}");
+                ExitCode::from(2)
             }
         },
         Some("version") => {
@@ -53,6 +67,7 @@ const USAGE: &str =
      Usage:\n\
      \x20 kubectl imageless run <dir> --repo HOST/REPO [flags] -- COMMAND [ARG...]\n\
      \x20 kubectl imageless run --external <flake-ref> [flags] -- COMMAND [ARG...]\n\
+     \x20 kubectl imageless doctor [flags]\n\
      \x20 kubectl imageless version\n\
      \n\
      The directory must contain a flake.nix whose output builds the container\n\
@@ -87,6 +102,81 @@ const USAGE: &str =
      \x20 --plain-http          push over http:// to a non-loopback registry (localhost,\n\
      \x20                       *.localhost, 127.0.0.1 and [::1] use http automatically)\n\
      \x20 --dry-run             print digests and the pod manifest; no network";
+
+const DOCTOR_USAGE: &str = "kubectl imageless doctor — report whether a cluster is prepared\n\
+     \n\
+     Usage:\n\
+     \x20 kubectl imageless doctor [flags]\n\
+     \n\
+     Reports what the API server can be asked about: the RuntimeClass, the node\n\
+     label it schedules on, and which nodes carry it. The node-local half of the\n\
+     seam — containerd's runtime handler, the shim binary, the policy file — has\n\
+     no API representation, so a green report is not proof a pod will start.\n\
+     \n\
+     kubectl's connection flags (--context, --namespace, --kubeconfig, --as, …)\n\
+     are forwarded verbatim. They must come after `imageless`: kubectl stops\n\
+     collecting the plugin command path at the first flag, so\n\
+     `kubectl --context x imageless doctor` never reaches this plugin at all.\n\
+     \n\
+     Flags:\n\
+     \x20 --runtime-class NAME  RuntimeClass to look for (default: imageless)\n\
+     \x20 --policy PATH         also check a node policy file (a local copy; doctor\n\
+     \x20                       cannot read a node's /etc/imageless/policy.json)\n\
+     \x20 --source REF          also check a flake reference against the contract, and\n\
+     \x20                       against --policy's prefixes when both are given\n\
+     \x20 --repo HOST/REPO      also check registry reachability and credentials\n\
+     \x20 --plain-http          reach --repo over http://\n\
+     \x20 --json                one JSON document on stdout instead of text\n\
+     \x20 --strict              treat warnings as failures (exit 1)\n\
+     \n\
+     Exit: 0 healthy, 1 a check failed, 2 usage, 3 the cluster could not be probed.";
+
+#[cfg_attr(test, derive(Debug))]
+enum ParsedDoctor {
+    Help,
+    Doctor(Box<doctor::Options>),
+}
+
+fn parse_doctor(arguments: &[String]) -> Result<ParsedDoctor, String> {
+    let (connection, arguments) = kubectl::split_connection_flags(arguments);
+    let mut runtime_class = "imageless".to_string();
+    let mut json = false;
+    let mut strict = false;
+    let mut policy = None;
+    let mut source = None;
+    let mut repo = None;
+    let mut plain_http = false;
+
+    let mut iterator = arguments.iter();
+    while let Some(argument) = iterator.next() {
+        let mut value = |flag: &str| match iterator.next() {
+            Some(next) if !next.starts_with('-') => Ok(next.clone()),
+            _ => Err(format!("{flag} requires a value")),
+        };
+        match argument.as_str() {
+            "--help" | "-h" => return Ok(ParsedDoctor::Help),
+            "--runtime-class" => runtime_class = value("--runtime-class")?,
+            "--policy" => policy = Some(PathBuf::from(value("--policy")?)),
+            "--source" => source = Some(value("--source")?),
+            "--repo" => repo = Some(value("--repo")?),
+            "--plain-http" => plain_http = true,
+            "--json" => json = true,
+            "--strict" => strict = true,
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            extra => return Err(format!("unexpected argument `{extra}`")),
+        }
+    }
+    Ok(ParsedDoctor::Doctor(Box::new(doctor::Options {
+        runtime_class,
+        connection,
+        json,
+        strict,
+        policy,
+        source,
+        repo,
+        plain_http,
+    })))
+}
 
 /// Requested help goes to stdout and succeeds; usage shown on a parse error
 /// goes to stderr with the conventional usage-error exit code.
