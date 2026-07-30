@@ -37,6 +37,38 @@ jobs:
         run: |
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
           nix run -L .#stock-oci-smoke
+      # Rung 2 of the push validation ladder (tests/push.rs is rung 1): the
+      # hermetic stub encodes our reading of the distribution spec, and only
+      # a real registry catches a misreading (upload sessions, server-side
+      # digest verification). Loopback ⇒ plain HTTP with zero flags. The
+      # second push must ride the HEAD-hit path; the pulls verify the stored
+      # bytes are the ones the pod manifest pins, by tag and by digest.
+      - name: kubectl-imageless push smoke against a real registry
+        run: |
+          set -o pipefail
+          docker run -d -p 127.0.0.1:5000:5000 --name registry registry:2
+          nix build -L .#kubectl-imageless
+          export DOCKER_CONFIG="$(mktemp -d)"
+          mkdir smoke-src && printf '{ outputs = _: { }; }\n' > smoke-src/flake.nix
+          curl -fsS --retry 15 --retry-all-errors --retry-delay 1 http://127.0.0.1:5000/v2/
+          for round in 1 2; do
+            ./result/bin/kubectl-imageless run ./smoke-src \
+              --repo 127.0.0.1:5000/team/smoke --tag smoke -- /bin/true \
+              > pod.json 2> "push-$round.log"
+            cat "push-$round.log"
+          done
+          # Round two must find both blobs already present, not re-upload them.
+          test "$(grep -c 'already present' push-2.log)" = 2 || {
+            echo "::error::re-push did not take the HEAD-hit path"; exit 1; }
+          image=$(jq -r '.spec.containers[0].image' pod.json)
+          digest="${image#*@}"
+          for ref in "$digest" smoke; do
+            curl -fsS -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+              "http://127.0.0.1:5000/v2/team/smoke/manifests/$ref" > fetched.json
+            got="sha256:$(sha256sum < fetched.json | cut -d' ' -f1)"
+            test "$got" = "$digest" || {
+              echo "::error::manifest by $ref is $got, not $digest"; exit 1; }
+          done
 
   # The two acceptance gates are NixOS VM tests and need KVM. GitHub-hosted
   # Linux runners expose /dev/kvm; the guard below fails LOUDLY if that ever
