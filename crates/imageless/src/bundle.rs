@@ -103,6 +103,18 @@ pub struct BundleTimings {
     pub policy_verification_us: u64,
     pub substitution_us: u64,
     pub rewrite_us: u64,
+    /// Carved out of `policy_verification_us` by the materializer: fetching the
+    /// release manifest, which is a network round trip on an HTTPS issuer.
+    pub manifest_fetch_us: u64,
+    /// Carved out of `substitution_us`: copying an embedded development source
+    /// out of the image's rootfs. Zero for a release.
+    pub staging_us: u64,
+    /// Carved out of `substitution_us`: the Nix process itself.
+    pub evaluation_us: u64,
+    /// Carved out of `substitution_us`: registering the GC root. For a caller
+    /// that joined another's in-flight materialization, this is the whole of
+    /// its own Nix cost.
+    pub root_registration_us: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +160,10 @@ pub fn prepare_bundle(prepare: &PrepareBundle) -> io::Result<Option<AppliedResol
             policy_verification_us: success.timings.policy_verification_us,
             substitution_us: success.timings.substitution_us,
             rewrite_us: elapsed_us(rewrite_started),
+            manifest_fetch_us: success.timings.manifest_fetch_us,
+            staging_us: success.timings.staging_us,
+            evaluation_us: success.timings.evaluation_us,
+            root_registration_us: success.timings.root_registration_us,
         },
     }))
 }
