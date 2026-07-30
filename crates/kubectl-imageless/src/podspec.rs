@@ -4,7 +4,7 @@
 //! anything is printed, so a selection the node would reject is rejected at
 //! authoring time with the node's own error text.
 
-use imageless::{plan, Materialize, OUTPUT_ANNOTATION, SOURCE_ANNOTATION};
+use imageless::{plan, Materialize, OUTPUT_ANNOTATION, RELEASE_ANNOTATION, SOURCE_ANNOTATION};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,16 +13,29 @@ use std::path::Path;
 /// flake; written explicitly so the pod manifest is self-describing.
 pub const EMBEDDED_SOURCE: &str = "/etc/imageless";
 
+/// Which annotation family tells the node what to materialize.
+///
+/// The two are mutually exclusive by SPEC §3 — `plan` refuses a pod carrying
+/// both — so they are one enum rather than two optional fields that could be
+/// set together.
+pub enum Deploy<'a> {
+    /// `run.imageless.source`: `EMBEDDED_SOURCE` for a packed seed, or a flake
+    /// reference the node evaluates. Carries no grammar of its own; `plan`
+    /// decides whether it is admissible.
+    Source(&'a str),
+    /// `imageless.run/release-v1`: a digest-addressed release the node resolves
+    /// against its issuer catalogs. Already pinned before it gets here — a
+    /// channel never reaches a pod manifest.
+    Release(&'a str),
+}
+
 pub struct PodSpec<'a> {
     pub name: &'a str,
     pub namespace: Option<&'a str>,
     /// Digest-pinned reference: `HOST/REPO@sha256:<manifest-digest>`.
     pub image: &'a str,
     pub runtime_class: &'a str,
-    /// What the node materializes: `EMBEDDED_SOURCE` for a packed seed, or an
-    /// external flake reference. `plan` below decides whether it is admissible
-    /// at all, so this field carries no grammar of its own.
-    pub source: &'a str,
+    pub deploy: Deploy<'a>,
     pub output: Option<&'a str>,
     pub command: &'a [String],
 }
@@ -36,9 +49,27 @@ pub fn pod(spec: &PodSpec) -> Result<Value, String> {
         );
     }
     validate_name(spec.name)?;
-    let mut annotations = HashMap::from([(SOURCE_ANNOTATION.to_string(), spec.source.to_string())]);
-    if let Some(output) = spec.output {
-        annotations.insert(OUTPUT_ANNOTATION.to_string(), output.to_string());
+    let mut annotations = HashMap::new();
+    match spec.deploy {
+        Deploy::Source(source) => {
+            annotations.insert(SOURCE_ANNOTATION.to_string(), source.to_string());
+            if let Some(output) = spec.output {
+                annotations.insert(OUTPUT_ANNOTATION.to_string(), output.to_string());
+            }
+        }
+        Deploy::Release(reference) => {
+            annotations.insert(RELEASE_ANNOTATION.to_string(), reference.to_string());
+            // A release manifest names its own rootfs and process metadata, so
+            // there is no output to select. `plan` returns before it would read
+            // this annotation, which means writing it anyway would produce a pod
+            // whose manifest claims something the node silently ignores.
+            if spec.output.is_some() {
+                return Err(
+                    "--output selects a flake output; a release manifest names its own rootfs"
+                        .to_string(),
+                );
+            }
+        }
     }
     // A plan of `None` means the node would decline to materialize this pod at
     // all — today unreachable, since nothing here emits a container selector,
@@ -47,7 +78,10 @@ pub fn pod(spec: &PodSpec) -> Result<Value, String> {
     let materialize = plan(&annotations, Path::new("/"), "rootfs")
         .map_err(|error| error.to_string())?
         .ok_or("the annotations select no container to materialize")?;
-    debug_assert!(matches!(materialize, Materialize::Flake(_)));
+    debug_assert!(match spec.deploy {
+        Deploy::Source(_) => matches!(materialize, Materialize::Flake(_)),
+        Deploy::Release(_) => matches!(materialize, Materialize::Release(_)),
+    });
 
     let mut metadata = json!({
         "name": spec.name,
@@ -138,7 +172,7 @@ mod tests {
             namespace: None,
             image: "registry.example/apps/demo@sha256:0000",
             runtime_class: "imageless",
-            source: EMBEDDED_SOURCE,
+            deploy: Deploy::Source(EMBEDDED_SOURCE),
             output: None,
             command,
         }
