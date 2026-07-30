@@ -182,6 +182,43 @@ quickstart supplies neither:
   boundary — an unterminated `github:myorg` also authorizes
   `github:myorg-evil/anything`.
 
+`--release` deploys the third mode: a digest-addressed release the node resolves
+against its own issuer catalogs, with no evaluation anywhere. Digests are for
+machines, so the client resolves a channel name to one for you:
+
+```bash
+# Print the pinned reference and nothing else, so it composes.
+kubectl imageless pin example/agent --catalog https://releases.example.com
+# -> example/agent@sha256:3061…5072
+
+# Or go straight to a pod, pinning on the way.
+kubectl imageless run --release example/agent \
+  --catalog https://releases.example.com \
+  --image localhost/imageless-placeholder:v1 \
+  -- /bin/agent | kubectl apply -f -
+```
+
+A coordinate is `issuer/name[:channel]`, defaulting to `:stable`. The catalog is
+a local directory or an HTTPS base URL — `http://` is refused, since a pointer
+read over plain HTTP chooses what a cluster runs. **The channel never reaches
+the pod**: the manifest records the digest the channel pointed at, so
+republishing a channel changes what the next `pin` returns and cannot change
+what an admitted pod runs. This is also why `--catalog` has no default —
+resolving against a catalog nobody named is how you deploy something nobody
+chose.
+
+`--catalog` is a *client-side* convenience that the node contract does not know
+about. SPEC §6 requires nodes to ignore the `refs/<name>/<channel>` index
+entirely; a node accepts digest-addressed references only, and node-side
+resolution of a mutable pointer is non-conforming. Publishers building a catalog
+with `nix/release-catalog.nix` get the index from a `channels = [ "stable" ];`
+argument and the same pinned string as `passthru.reference`.
+
+`--release` refuses to combine with `--external` (SPEC §3 makes the two
+annotation families mutually exclusive) or with `--output` (a release manifest
+names its own rootfs, so the node never reads an output annotation and a pod
+claiming one would be quietly wrong).
+
 `doctor` reports whether a cluster is prepared at all:
 
 ```bash

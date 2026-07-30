@@ -5,12 +5,14 @@
 # whatever release pipeline the issuer runs — any CI that can copy a closure
 # and emit this JSON conforms.
 { lib
-, writeTextDir
+, runCommand
+, writeText
 , rootfsTargets
 , issuer
 , releaseName
 , cache ? "default"
 , process ? null
+, channels ? [ ]
 }:
 
 let
@@ -30,10 +32,31 @@ let
   json = builtins.toJSON manifest;
   digest = builtins.hashString "sha256" json;
   reference = "${issuer}/${releaseName}@sha256:${digest}";
-  catalog = writeTextDir "sha256/${digest}.json" json;
+  # Written through `writeText` rather than echoed by the builder so the file's
+  # bytes are exactly the ones hashed above: a node validates the fetched
+  # manifest against its digest, so a stray newline would fail resolution.
+  manifestFile = writeText "imageless-release-manifest" json;
 in
-catalog.overrideAttrs (old: {
-  passthru = (old.passthru or { }) // {
-    inherit digest manifest reference;
-  };
-})
+runCommand "imageless-release-${issuer}"
+{
+  passthru = { inherit digest manifest reference channels; };
+}
+  (''
+    mkdir -p "$out/sha256"
+    cp ${manifestFile} "$out/sha256/${digest}.json"
+  ''
+  # The name/channel index (SPEC.md §6): a pointer is 64 lowercase hex digits
+  # and nothing else. It exists so client-side tooling — `kubectl imageless
+  # pin`, or `run --release` — can turn a human-friendly name into the pinned
+  # reference a node accepts. Nodes MUST ignore it, so publishing a channel is
+  # a convenience for authors and never part of what a running pod resolves.
+  #
+  # Republishing a channel is the whole point of having one: it changes what
+  # the next `pin` returns, and cannot change any pod already admitted, because
+  # the pod records the digest rather than the channel.
+  + lib.concatMapStrings
+    (channel: ''
+      mkdir -p "$out/refs/${releaseName}"
+      printf '%s\n' "${digest}" > "$out/refs/${releaseName}/${channel}"
+    '')
+    channels)

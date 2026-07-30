@@ -60,11 +60,15 @@ of arriving alongside the core the way they did in the incubation repo.
       Nix-free.
 - [ ] Documented dev-cluster quickstart (kind/k3d) so the plugin has a
       five-minute path from nothing to a running flake.
-- [ ] **No hand-typed digests.** Optional catalog name/channel index
+- [x] **No hand-typed digests.** Optional catalog name/channel index
       (`refs/<name>/<channel>` → digest, client-side only; nodes ignore it)
-      plus `kubectl imageless pin <issuer>/<name>` and pin-on-apply, so
-      release references are resolved to `@sha256:…` by tooling at authoring
-      time. Examples never show `REPLACE_DIGEST` — they show the pin flow or
+      plus `kubectl imageless pin <issuer>/<name>` and pin-on-apply
+      (`run --release`), so release references are resolved to `@sha256:…` by
+      tooling at authoring time. SPEC §6 fixes the pointer format at 64
+      lowercase hex digits — too small to grow a schema a client would have to
+      interpret. `nix/release-catalog.nix` publishes the index from a
+      `channels` argument, so the repo's own helper emits a catalog `pin`
+      reads. Examples never show `REPLACE_DIGEST` — they show the pin flow or
       Nix's `.reference` templating. The node contract stays digest-only.
 - [ ] *(stretch)* **Shebang scripts as deployables.** `kubectl imageless run
       ./script.sh` where the entry file carries a `#!/usr/bin/env nix` +
