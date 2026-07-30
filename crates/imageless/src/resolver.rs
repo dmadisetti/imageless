@@ -1437,6 +1437,36 @@ fn set_staged_access(
     if unsafe { libc::chown(path.as_ptr(), effective_uid(), worker_gid) } == -1 {
         return Err(staging_error(io::Error::last_os_error()));
     }
+    // Nix folds mtimes into the fingerprint that keys a `path:` flake's
+    // evaluation cache, and the staged path itself is *not* in it. Measured on
+    // the nix the gate pins: two byte-identical trees at different paths share
+    // one cache entry when their mtimes agree, and get one entry each when they
+    // differ. Staging stamps "now", so every create of an unchanged seed missed
+    // that cache — a restart, a CrashLoopBackOff retry, a second replica, and
+    // each container of a multi-container pod all paid a cold evaluation.
+    //
+    // Any deterministic value would do; the epoch is the one the seed layer
+    // already uses (kubectl-imageless packs tars with a zero mtime), so this
+    // restores determinism the tar had rather than inventing one.
+    //
+    // Directories are stamped by the caller *after* their children, so a child
+    // write cannot bump the parent back to now. Both matter: file and directory
+    // mtimes are each in the fingerprint.
+    let epoch = [libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    }; 2];
+    if unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            epoch.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == -1
+    {
+        return Err(staging_error(io::Error::last_os_error()));
+    }
     Ok(())
 }
 
@@ -2261,6 +2291,117 @@ rmdir "{state}/lock"
             assert!(error.diagnostic.contains("remote scheme"));
         }
         assert!(!bundle.join(GC_ROOT_NAME).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A seed tree with a nested directory, so the directory stamp is covered
+    /// too: Nix folds both file and directory mtimes into the fingerprint.
+    fn seed_tree(root: &Path) {
+        std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+        std::fs::write(root.join("flake.nix"), "{ outputs = _: { }; }\n").unwrap();
+        std::fs::write(root.join("nested/deeper/data"), "payload").unwrap();
+        std::fs::write(root.join("nested/run.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(
+            root.join("nested/run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    fn stage(source: &Path) -> (String, StagedDevelopmentSource) {
+        stage_development_installable(
+            &format!("path:{}#rootfs", source.display()),
+            None,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap()
+        .expect("a path: installable is staged")
+    }
+
+    fn walk(root: &Path, visit: &mut impl FnMut(&Path, &std::fs::Metadata)) {
+        let metadata = std::fs::symlink_metadata(root).unwrap();
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(root).unwrap() {
+                walk(&entry.unwrap().path(), visit);
+            }
+        }
+        visit(root, &metadata);
+    }
+
+    #[test]
+    fn staged_copies_carry_epoch_mtimes_on_files_and_directories() {
+        // Nix keys a `path:` flake's evaluation cache on mtimes and not on the
+        // staged path, so stamping "now" made every create of an unchanged seed
+        // miss that cache. Directories count as much as files, which is why the
+        // seed tree here is nested rather than flat.
+        let dir = temporary("staged-mtimes");
+        let source = dir.join("seed");
+        seed_tree(&source);
+        let (_, staged) = stage(&source);
+
+        let mut checked = 0;
+        walk(&staged.directory, &mut |path, metadata| {
+            assert_eq!(
+                metadata.mtime(),
+                0,
+                "{} was staged with mtime {}",
+                path.display(),
+                metadata.mtime()
+            );
+            checked += 1;
+        });
+        // The tree, not just its root: 3 directories plus 3 files.
+        assert_eq!(checked, 6, "the whole staged tree must be stamped");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn two_stagings_of_one_seed_are_identical_apart_from_their_path() {
+        // The property the evaluation cache actually keys on. Staging stays
+        // per-create and nonce'd; what changes is that two creates of the same
+        // seed now present Nix with indistinguishable trees.
+        let dir = temporary("staged-stable");
+        let source = dir.join("seed");
+        seed_tree(&source);
+
+        let mut fingerprints = Vec::new();
+        for _ in 0..2 {
+            let (_, staged) = stage(&source);
+            let mut entries = Vec::new();
+            walk(&staged.directory, &mut |path, metadata| {
+                entries.push((
+                    path.strip_prefix(&staged.directory).unwrap().to_path_buf(),
+                    metadata.mtime(),
+                    metadata.mode(),
+                    metadata.is_dir(),
+                ));
+            });
+            entries.sort();
+            fingerprints.push(entries);
+        }
+        assert_eq!(fingerprints[0], fingerprints[1]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn staged_content_and_modes_survive_the_mtime_pin() {
+        // utimensat runs after the chmod/chown, so this pins that stamping the
+        // tree did not undo the access control staging exists to apply.
+        let dir = temporary("staged-content");
+        let source = dir.join("seed");
+        seed_tree(&source);
+        let (installable, staged) = stage(&source);
+
+        assert!(installable.ends_with("#rootfs"));
+        assert_eq!(
+            std::fs::read_to_string(staged.directory.join("nested/deeper/data")).unwrap(),
+            "payload"
+        );
+        // Executability is preserved as the 0o750/0o640 split staging applies.
+        let script = std::fs::metadata(staged.directory.join("nested/run.sh")).unwrap();
+        assert_eq!(script.mode() & 0o777, 0o750);
+        let data = std::fs::metadata(staged.directory.join("nested/deeper/data")).unwrap();
+        assert_eq!(data.mode() & 0o777, 0o640);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
