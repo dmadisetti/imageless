@@ -13,6 +13,7 @@
 //! contents.
 
 mod auth;
+mod catalog;
 mod doctor;
 mod flakeref;
 mod kubectl;
