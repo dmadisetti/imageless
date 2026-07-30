@@ -41,7 +41,15 @@ const CONNECTION_VALUE_FLAGS: &[&str] = &[
 ];
 
 /// Connection flags that take no value.
-const CONNECTION_SWITCHES: &[&str] = &["--insecure-skip-tls-verify", "--all-namespaces", "-A"];
+///
+/// Every flag in both lists is one kubectl registers on its *root* command, so
+/// it is accepted by each subcommand driven here. `--all-namespaces`/`-A` is
+/// not: `get` defines it, `version` and `config view` do not, so forwarding it
+/// would fail the first two checks with kubectl's "unknown flag" rather than
+/// anything about the cluster. It is also not a connection flag — doctor lists
+/// nothing namespaced — so it belongs in neither list, and reaches the user as
+/// this command's own unknown-flag error instead.
+const CONNECTION_SWITCHES: &[&str] = &["--insecure-skip-tls-verify"];
 
 /// A diagnostic must not hang on a black-holed API server.
 const DEFAULT_REQUEST_TIMEOUT: &str = "--request-timeout=10s";
@@ -273,6 +281,19 @@ mod tests {
             split_connection_flags(&words(&["--insecure-skip-tls-verify", "--json"]));
         assert_eq!(connection, words(&["--insecure-skip-tls-verify"]));
         assert_eq!(rest, words(&["--json"]));
+    }
+
+    #[test]
+    fn all_namespaces_is_not_forwarded_and_so_becomes_an_unknown_flag() {
+        // `get` defines -A; `version` and `config view` do not. Forwarding it
+        // would fail doctor's first two checks with kubectl's "unknown flag"
+        // instead of anything about the cluster, so it stays in `rest` and the
+        // caller rejects it with its own message.
+        let (connection, rest) = split_connection_flags(&words(&["-A", "--json"]));
+        assert!(connection.is_empty(), "{connection:?}");
+        assert_eq!(rest, words(&["-A", "--json"]));
+        let (connection, _) = split_connection_flags(&words(&["--all-namespaces"]));
+        assert!(connection.is_empty(), "{connection:?}");
     }
 
     #[test]
