@@ -80,8 +80,8 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Resul
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("materializer stderr was not captured"))?;
-    let stdout_reader = thread::spawn(move || capture_output(stdout));
-    let stderr_reader = thread::spawn(move || capture_output(stderr));
+    let stdout_reader = thread::spawn(move || capture_output(stdout, Retention::Head));
+    let stderr_reader = thread::spawn(move || capture_output(stderr, Retention::Tail));
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -92,10 +92,17 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Resul
             let _ = child.kill();
             let _ = child.wait();
             let _ = join_capture(stdout_reader);
-            let _ = join_capture(stderr_reader);
+            // What Nix last said is the only evidence of where a create that
+            // ran out of deadline actually got to — for `--realise`, the path
+            // substitution was working on. It was already in memory and
+            // discarded here, which made a wedge on the first path and a copy
+            // of the six-hundredth produce the same sentence.
+            let excerpt = join_capture(stderr_reader)
+                .map(|stderr| diagnostic_excerpt(&stderr.bytes))
+                .unwrap_or_default();
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "Nix operation timed out",
+                timed_out("Nix operation timed out", &excerpt),
             ));
         }
         thread::sleep(Duration::from_millis(10));
@@ -108,10 +115,15 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Resul
         if started.elapsed() >= timeout {
             kill_process_group(child.id());
             let _ = join_capture(stdout_reader);
-            let _ = join_capture(stderr_reader);
+            let excerpt = join_capture(stderr_reader)
+                .map(|stderr| diagnostic_excerpt(&stderr.bytes))
+                .unwrap_or_default();
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "Nix operation output did not close before the deadline",
+                timed_out(
+                    "Nix operation output did not close before the deadline",
+                    &excerpt,
+                ),
             ));
         }
         thread::sleep(Duration::from_millis(10));
@@ -125,9 +137,7 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Resul
         // The tail is where Nix puts the actual error; without it a failed
         // evaluation is undiagnosable (the engine may discard the runtime's
         // stderr entirely — containerd keeps nothing from a failed create).
-        let tail = stderr.bytes.len().saturating_sub(4096);
-        let excerpt = String::from_utf8_lossy(&stderr.bytes[tail..]);
-        let excerpt = excerpt.trim();
+        let excerpt = diagnostic_excerpt(&stderr.bytes);
         return Err(io::Error::other(if excerpt.is_empty() {
             "Nix operation failed".to_string()
         } else {
@@ -137,12 +147,66 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Resul
     Ok(String::from_utf8_lossy(&stdout.bytes).into_owned())
 }
 
+fn timed_out(reason: &str, excerpt: &str) -> String {
+    if excerpt.is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}; Nix last reported: {excerpt}")
+    }
+}
+
+/// How much of another program's stderr a diagnostic may carry.
+///
+/// Deliberately far below [`MAX_FRAME_BYTES`]. On the daemon deployment this
+/// text is serialized into a `ResolveResponse::Error` and written by
+/// `write_frame`, which hard-fails past that ceiling — so an over-long
+/// diagnostic would cost the caller the response entirely and leave it holding
+/// a closed connection instead of a reason. Encoding inflates, too: a byte that
+/// is not valid UTF-8 becomes a three-byte U+FFFD, and JSON escapes a quote or
+/// a backslash to two. Stripping the control bytes below bounds the worst case
+/// at three times this, which leaves the rest of the frame ample room.
+const MAX_EXCERPT_BYTES: usize = 2048;
+
+/// The tail of a Nix stderr capture, made safe to carry in a diagnostic.
+///
+/// Control bytes are dropped rather than escaped. They are the expensive ones
+/// to encode, and this text reaches terminals and log records where an escape
+/// sequence would rewrite the line around it. Newlines stay: Nix's errors are
+/// structured across them, and a diagnosis flattened to one line is harder to
+/// read than the thing it describes.
+fn diagnostic_excerpt(stderr: &[u8]) -> String {
+    let tail = stderr.len().saturating_sub(MAX_EXCERPT_BYTES);
+    let mut excerpt = String::new();
+    for character in String::from_utf8_lossy(&stderr[tail..]).chars() {
+        if excerpt.len() + character.len_utf8() > MAX_EXCERPT_BYTES {
+            break;
+        }
+        if character == '\n' || !character.is_control() {
+            excerpt.push(character);
+        }
+    }
+    excerpt.trim().to_string()
+}
+
 struct CapturedOutput {
     bytes: Vec<u8>,
     truncated: bool,
 }
 
-fn capture_output(mut pipe: impl Read) -> io::Result<CapturedOutput> {
+/// Which end of an over-long stream to keep.
+///
+/// stdout is parsed for a single store path, so losing its head would silently
+/// change the answer — it keeps the head and reports truncation, which the
+/// caller turns into a hard error. stderr is only ever read as a diagnosis, and
+/// Nix puts the error at the end, so keeping its head meant a truncated log
+/// yielded an "excerpt" from a megabyte before the failure.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Retention {
+    Head,
+    Tail,
+}
+
+fn capture_output(mut pipe: impl Read, retention: Retention) -> io::Result<CapturedOutput> {
     let mut bytes = Vec::new();
     let mut truncated = false;
     let mut chunk = [0_u8; 8192];
@@ -151,9 +215,29 @@ fn capture_output(mut pipe: impl Read) -> io::Result<CapturedOutput> {
         if count == 0 {
             break;
         }
-        let remaining = MAX_CAPTURE_BYTES.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&chunk[..count.min(remaining)]);
-        truncated |= count > remaining;
+        match retention {
+            Retention::Head => {
+                let remaining = MAX_CAPTURE_BYTES.saturating_sub(bytes.len());
+                bytes.extend_from_slice(&chunk[..count.min(remaining)]);
+                truncated |= count > remaining;
+            }
+            Retention::Tail => {
+                bytes.extend_from_slice(&chunk[..count]);
+                // Drop a whole window at a time rather than trimming on every
+                // chunk: a long build log then costs one move per
+                // MAX_CAPTURE_BYTES instead of one per 8 KiB read.
+                if bytes.len() > MAX_CAPTURE_BYTES.saturating_mul(2) {
+                    let excess = bytes.len() - MAX_CAPTURE_BYTES;
+                    bytes.drain(..excess);
+                    truncated = true;
+                }
+            }
+        }
+    }
+    if retention == Retention::Tail && bytes.len() > MAX_CAPTURE_BYTES {
+        let excess = bytes.len() - MAX_CAPTURE_BYTES;
+        bytes.drain(..excess);
+        truncated = true;
     }
     Ok(CapturedOutput { bytes, truncated })
 }
@@ -178,6 +262,104 @@ pub(crate) fn kill_process_group(pid: u32) {
 mod tests {
     use super::*;
     use crate::testutil::STORE;
+
+    #[test]
+    fn a_timed_out_command_reports_what_nix_last_wrote() {
+        // The whole point of the change: a create that runs out of deadline
+        // while Nix is working says what Nix was working on. Without it, a
+        // wedge on the first store path and a copy of the six-hundredth
+        // produce the same sentence.
+        let error = run_command(
+            Command::new("sh").args([
+                "-c",
+                "printf 'copying path %s from cache\\n' /nix/store/aaa >&2; sleep 30",
+            ]),
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let message = error.to_string();
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("/nix/store/aaa"), "{message}");
+    }
+
+    #[test]
+    fn a_timeout_with_a_silent_command_still_names_the_deadline() {
+        let error = run_command(
+            Command::new("sh").args(["-c", "sleep 30"]),
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        // No excerpt to add, so no dangling "Nix last reported:" clause.
+        assert_eq!(error.to_string(), "Nix operation timed out");
+    }
+
+    #[test]
+    fn stderr_keeps_its_tail_and_stdout_keeps_its_head() {
+        // stderr is read only as a diagnosis and Nix puts the error last, so
+        // retaining its head meant a truncated log yielded an "excerpt" from a
+        // megabyte before the failure. stdout is parsed for a store path, so
+        // losing its head would silently change the answer instead.
+        let long = MAX_CAPTURE_BYTES + 4096;
+        let head =
+            capture_output(std::io::repeat(b'h').take(long as u64), Retention::Head).unwrap();
+        assert_eq!(head.bytes.len(), MAX_CAPTURE_BYTES);
+        assert!(head.truncated);
+
+        let mut stream = vec![b'o'; long];
+        stream.extend_from_slice(b"THE ACTUAL ERROR");
+        let tail = capture_output(stream.as_slice(), Retention::Tail).unwrap();
+        assert_eq!(tail.bytes.len(), MAX_CAPTURE_BYTES);
+        assert!(tail.truncated);
+        assert!(tail.bytes.ends_with(b"THE ACTUAL ERROR"));
+        assert!(diagnostic_excerpt(&tail.bytes).ends_with("THE ACTUAL ERROR"));
+    }
+
+    #[test]
+    fn a_diagnostic_from_a_hostile_log_still_fits_the_protocol_frame() {
+        // On the daemon deployment this text is serialized into a
+        // ResolveResponse::Error and framed, and `write_frame` hard-fails past
+        // MAX_FRAME_BYTES. A diagnostic that could not be written would cost
+        // the caller the response entirely — a closed connection instead of a
+        // reason, which is worse than the bare timeout this replaces.
+        let hostile: Vec<u8> = (0..MAX_CAPTURE_BYTES)
+            .map(|index| match index % 3 {
+                0 => 0x1b, // escape: would rewrite a terminal line
+                1 => 0xff, // invalid UTF-8: becomes a three-byte U+FFFD
+                _ => b'"', // JSON-escaped, two bytes out for one in
+            })
+            .collect();
+        let excerpt = diagnostic_excerpt(&hostile);
+        assert!(
+            !excerpt.contains('\u{1b}'),
+            "control bytes must not survive"
+        );
+        assert!(excerpt.len() <= MAX_EXCERPT_BYTES);
+
+        let response = crate::materialize::ResolveResponse::Error {
+            version: crate::PROTOCOL_VERSION,
+            error: crate::materialize::ResolutionError::timeout_with(
+                "during release materialization",
+                &excerpt,
+            ),
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(
+            encoded.len() < crate::MAX_FRAME_BYTES,
+            "encoded diagnostic was {} bytes, frame ceiling is {}",
+            encoded.len(),
+            crate::MAX_FRAME_BYTES
+        );
+    }
+
+    #[test]
+    fn newlines_survive_the_excerpt_but_other_control_bytes_do_not() {
+        // Nix structures its errors across lines; flattening them makes the
+        // diagnosis harder to read than the thing it describes.
+        let excerpt = diagnostic_excerpt(b"error: builder failed\n\x07  while evaluating\n");
+        assert_eq!(excerpt, "error: builder failed\n  while evaluating");
+    }
 
     #[test]
     fn realise_output_accepts_store_or_indirect_root_but_rejects_ambiguity() {

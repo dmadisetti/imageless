@@ -618,7 +618,9 @@ impl Resolver {
         let budget = remaining(deadline, "during materialization")?;
         let stdout = StageClock::time(&clock.evaluation_us, || run_command(&mut command, budget))
             .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => ResolutionError::timeout("during materialization"),
+            io::ErrorKind::TimedOut => {
+                ResolutionError::timeout_with("during materialization", &error.to_string())
+            }
             _ => ResolutionError::new(
                 ErrorCategory::Materialization,
                 format!("Nix could not materialize the requested rootfs: {error}"),
@@ -721,9 +723,10 @@ impl Resolver {
             let budget = remaining(deadline, "during development source evaluation")?;
             StageClock::time(&clock.evaluation_us, || run_command(&mut command, budget)).map_err(
                 |error| match error.kind() {
-                    io::ErrorKind::TimedOut => {
-                        ResolutionError::timeout("during development source evaluation")
-                    }
+                    io::ErrorKind::TimedOut => ResolutionError::timeout_with(
+                        "during development source evaluation",
+                        &error.to_string(),
+                    ),
                     _ => ResolutionError::new(
                         ErrorCategory::Materialization,
                         format!("the development resolver could not evaluate the source: {error}"),
@@ -919,9 +922,10 @@ impl Resolver {
             remaining(deadline, "while querying the authorized cache")?,
         )
         .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => {
-                ResolutionError::timeout("while querying the authorized cache")
-            }
+            io::ErrorKind::TimedOut => ResolutionError::timeout_with(
+                "while querying the authorized cache",
+                &error.to_string(),
+            ),
             _ => ResolutionError::new(
                 ErrorCategory::CacheQuery,
                 format!("the authorized cache could not describe the release closure: {error}"),
@@ -968,7 +972,9 @@ impl Resolver {
             remaining(deadline, "while checking the node store")?,
         )
         .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => ResolutionError::timeout("while checking the node store"),
+            io::ErrorKind::TimedOut => {
+                ResolutionError::timeout_with("while checking the node store", &error.to_string())
+            }
             _ => ResolutionError::new(
                 ErrorCategory::CacheQuery,
                 format!("the node store could not report valid closure paths: {error}"),
@@ -1072,7 +1078,9 @@ impl Resolver {
             remaining(deadline, "during release materialization")?,
         )
         .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => ResolutionError::timeout("during release materialization"),
+            io::ErrorKind::TimedOut => {
+                ResolutionError::timeout_with("during release materialization", &error.to_string())
+            }
             _ => ResolutionError::new(
                 ErrorCategory::Materialization,
                 format!("Nix could not materialize a release store path: {error}"),
@@ -1124,7 +1132,9 @@ impl Resolver {
             remaining(deadline, "during GC-root registration")?,
         )
         .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => ResolutionError::timeout("during GC-root registration"),
+            io::ErrorKind::TimedOut => {
+                ResolutionError::timeout_with("during GC-root registration", &error.to_string())
+            }
             _ => ResolutionError::new(
                 ErrorCategory::RootRegistration,
                 format!("Nix could not register the bundle GC root: {error}"),
