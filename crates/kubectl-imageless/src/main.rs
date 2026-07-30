@@ -5,14 +5,22 @@
 //! repository by digest, prints the layer/config/manifest digests on stderr,
 //! and prints the pod manifest on stdout so it pipes straight into
 //! `kubectl apply -f -`. `--dry-run` stops before the push, fully offline.
+//!
+//! `run --external <flake-ref>` packs nothing: the pod names the reference and
+//! the node evaluates it under node policy. Which mode runs is decided by the
+//! flag alone — never by what the argument looks like or by what exists on
+//! disk, so a trust-model switch can never hinge on the working directory's
+//! contents.
 
 mod auth;
+mod flakeref;
 mod oci;
 mod pack;
+mod placeholder;
 mod podspec;
 mod registry;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -39,19 +47,33 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "kubectl imageless — run a directory on an imageless cluster\n\
+const USAGE: &str =
+    "kubectl imageless — run a directory or a flake reference on an imageless cluster\n\
      \n\
      Usage:\n\
      \x20 kubectl imageless run <dir> --repo HOST/REPO [flags] -- COMMAND [ARG...]\n\
+     \x20 kubectl imageless run --external <flake-ref> [flags] -- COMMAND [ARG...]\n\
      \x20 kubectl imageless version\n\
      \n\
      The directory must contain a flake.nix whose output builds the container\n\
      rootfs. It is packed into a seed OCI image under the same bounds the node\n\
      stages it with, so a refusal happens here, with a path, not on the node.\n\
      \n\
+     With --external nothing is packed: the pod names the flake reference and\n\
+     the node evaluates it under node policy (cache_only: false, an allow-listed\n\
+     eval_allowed_uri_prefixes entry, and run.imageless.* passed through the\n\
+     containerd handler). Kubernetes still needs an image to create the container\n\
+     from: a content-free placeholder is pushed to --repo unless --image names\n\
+     one the cluster can already pull.\n\
+     \n\
      Flags:\n\
-     \x20 --repo HOST/REPO      repository the seed image belongs to (required)\n\
-     \x20 --name NAME           pod name (default: derived from the directory)\n\
+     \x20 --repo HOST/REPO      repository the pushed manifest belongs to (required;\n\
+     \x20                       with --external, --image replaces it)\n\
+     \x20 --external            deploy <flake-ref> instead of packing a directory\n\
+     \x20 --unpinned            allow an --external reference that pins nothing\n\
+     \x20 --image REF           --external only: an image the cluster can already pull\n\
+     \x20 --name NAME           pod name (default: derived from the directory, or from\n\
+     \x20                       the reference's repository — never its revision)\n\
      \x20 --namespace NS        pod namespace\n\
      \x20 --runtime-class NAME  RuntimeClass of imageless nodes (default: imageless)\n\
      \x20 --output NAME         flake output to materialize (default: rootfs)\n\
@@ -84,10 +106,24 @@ enum ParsedRun {
     Run(Box<RunOptions>),
 }
 
+/// What the pod will run. The variant is chosen by `--external` alone: the
+/// parser never stats the argument and never inspects its shape, so `run
+/// github:owner/repo` packs (and fails) rather than quietly shipping a
+/// node-evaluated reference, and a directory genuinely named `github:owner`
+/// still packs.
+#[cfg_attr(test, derive(Debug))]
+enum Source {
+    Directory(PathBuf),
+    External(String),
+}
+
 #[cfg_attr(test, derive(Debug))]
 struct RunOptions {
-    source: PathBuf,
-    repo: String,
+    source: Source,
+    /// `None` only in external mode with `--image`, where nothing is pushed.
+    repo: Option<String>,
+    image: Option<String>,
+    unpinned: bool,
     name: Option<String>,
     namespace: Option<String>,
     runtime_class: String,
@@ -103,6 +139,9 @@ struct RunOptions {
 fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
     let mut source = None;
     let mut repo = None;
+    let mut external = false;
+    let mut unpinned = false;
+    let mut image = None;
     let mut name = None;
     let mut namespace = None;
     let mut runtime_class = "imageless".to_string();
@@ -131,6 +170,9 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
             }
             "--help" | "-h" => return Ok(ParsedRun::Help),
             "--repo" => repo = Some(value("--repo")?),
+            "--external" => external = true,
+            "--unpinned" => unpinned = true,
+            "--image" => image = Some(value("--image")?),
             "--name" => name = Some(value("--name")?),
             "--namespace" => namespace = Some(value("--namespace")?),
             "--runtime-class" => runtime_class = value("--runtime-class")?,
@@ -141,35 +183,110 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
             "--plain-http" => plain_http = true,
             "--dry-run" => dry_run = true,
             flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
-            positional if source.is_none() => source = Some(PathBuf::from(positional)),
+            positional if source.is_none() => source = Some(positional.to_string()),
             extra => return Err(format!("unexpected argument `{extra}`")),
         }
     }
 
-    let source = source.ok_or("a source directory is required")?;
-    let repo = repo.ok_or("--repo HOST/REPO is required")?;
-    // Requiring a `/` enforces the promised HOST/REPO shape; a bare name
-    // would silently resolve against docker.io/library on the node. A colon
-    // after that slash is a smuggled tag — the push is digest-addressed, and
-    // `--tag` is the one way to name one. Before the slash it is a host port.
-    // URL metacharacters are rejected outright: the repository is interpolated
-    // into every request target, where a `?` would silently retarget the API
-    // path and a `%` would decode into a different repository.
-    let path = repo.split_once('/').map(|(_, path)| path);
-    if repo.is_empty()
-        || repo.contains(char::is_whitespace)
-        || repo.contains('@')
-        || repo.contains("://")
-        || repo.contains(['?', '#', '%', '[', ']', '\\'])
-        || !repo.is_ascii()
-        || path.is_none_or(|path| {
-            path.is_empty() || path.contains(':') || path.split('/').any(str::is_empty)
-        })
-    {
-        return Err(format!(
-            "--repo `{repo}` must be a bare repository like registry.example/team/app \
-             (no scheme, tag, or digest)"
-        ));
+    // Flags that only make sense for one mode are refused rather than ignored:
+    // a silently dropped `--tag` looks like it worked.
+    if !external {
+        if image.is_some() {
+            return Err(
+                "--image applies to --external references; a packed directory's image \
+                 is the seed pushed to --repo"
+                    .to_string(),
+            );
+        }
+        if unpinned {
+            return Err(
+                "--unpinned applies to --external references; a packed directory pins \
+                 its own bytes"
+                    .to_string(),
+            );
+        }
+    } else if include_vcs {
+        return Err(
+            "--include-vcs applies to a packed directory; --external packs nothing".to_string(),
+        );
+    }
+    if image.is_some() {
+        if repo.is_some() {
+            return Err(
+                "pass --repo (to push a placeholder image there) or --image (an image the \
+                 cluster can already pull), not both"
+                    .to_string(),
+            );
+        }
+        // These three describe the manifest this command pushes, and with
+        // `--image` it pushes none.
+        for (flag, present) in [("--tag", tag.is_some()), ("--plain-http", plain_http)] {
+            if present {
+                return Err(format!(
+                    "{flag} applies to the manifest this command pushes; --image pushes nothing"
+                ));
+            }
+        }
+    }
+
+    let source = source.ok_or(if external {
+        "an external flake reference is required after --external"
+    } else {
+        "a source directory is required"
+    })?;
+    let source = if external {
+        flakeref::validate(&source)?;
+        match flakeref::pin(&source)? {
+            Some(_) => {}
+            None if unpinned => {}
+            None => {
+                return Err(format!(
+                    "{}; pass --unpinned to deploy it anyway",
+                    flakeref::unpinned_diagnostic(&source)
+                ))
+            }
+        }
+        Source::External(source)
+    } else {
+        Source::Directory(PathBuf::from(source))
+    };
+    if external && repo.is_none() && image.is_none() {
+        return Err(
+            "--external needs somewhere to get the pod's image: --repo HOST/REPO to push \
+             a placeholder to, or --image REF naming one the cluster can already pull"
+                .to_string(),
+        );
+    }
+    if !external && repo.is_none() {
+        return Err("--repo HOST/REPO is required".to_string());
+    }
+    // External mode with `--image` pushes nothing, so there is no push target
+    // to validate — every check below is about one.
+    if let Some(repo) = &repo {
+        // Requiring a `/` enforces the promised HOST/REPO shape; a bare name
+        // would silently resolve against docker.io/library on the node. A colon
+        // after that slash is a smuggled tag — the push is digest-addressed,
+        // and `--tag` is the one way to name one. Before the slash it is a host
+        // port. URL metacharacters are rejected outright: the repository is
+        // interpolated into every request target, where a `?` would silently
+        // retarget the API path and a `%` would decode into a different
+        // repository.
+        let path = repo.split_once('/').map(|(_, path)| path);
+        if repo.is_empty()
+            || repo.contains(char::is_whitespace)
+            || repo.contains('@')
+            || repo.contains("://")
+            || repo.contains(['?', '#', '%', '[', ']', '\\'])
+            || !repo.is_ascii()
+            || path.is_none_or(|path| {
+                path.is_empty() || path.contains(':') || path.split('/').any(str::is_empty)
+            })
+        {
+            return Err(format!(
+                "--repo `{repo}` must be a bare repository like registry.example/team/app \
+                 (no scheme, tag, or digest)"
+            ));
+        }
     }
     if let Some(tag) = &tag {
         // The OCI tag grammar; failing here beats a registry's opaque 400.
@@ -197,6 +314,8 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
     Ok(ParsedRun::Run(Box::new(RunOptions {
         source,
         repo,
+        image,
+        unpinned,
         name,
         namespace,
         runtime_class,
@@ -211,14 +330,28 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
 }
 
 fn run(options: &RunOptions) -> ExitCode {
+    match &options.source {
+        Source::Directory(directory) => run_packed(options, directory),
+        Source::External(reference) => run_external(options, reference),
+    }
+}
+
+fn run_packed(options: &RunOptions, directory: &Path) -> ExitCode {
     let packed = match pack::pack_source(
-        &options.source,
+        directory,
         &pack::PackOptions {
             include_vcs: options.include_vcs,
         },
     ) {
         Ok(packed) => packed,
-        Err(error) => return fail(error),
+        Err(error) => {
+            if let Some(hint) = packing_failure_hint(directory) {
+                eprintln!("kubectl-imageless: {error}");
+                eprintln!("{hint}");
+                return ExitCode::FAILURE;
+            }
+            return fail(error);
+        }
     };
     for path in &packed.skipped_vcs {
         eprintln!(
@@ -230,7 +363,7 @@ fn run(options: &RunOptions) -> ExitCode {
         eprintln!(
             "warning: {} has no flake.lock — the node will lock inputs at run time, so two\n\
              runs of the same seed can materialize different closures; commit a flake.lock",
-            options.source.display()
+            directory.display()
         );
     }
     eprintln!(
@@ -241,6 +374,129 @@ fn run(options: &RunOptions) -> ExitCode {
         imageless::MAX_STAGED_SOURCE_BYTES
     );
     let image = oci::assemble(packed.tar, &options.arch);
+    report_digests(&image);
+    let repo = options
+        .repo
+        .as_deref()
+        .expect("packed mode requires --repo");
+    if !options.dry_run {
+        if let Err(error) = push(options, repo, &image) {
+            return fail(error);
+        }
+    }
+
+    let name = options
+        .name
+        .clone()
+        .unwrap_or_else(|| podspec::derive_name(directory));
+    emit(&podspec::PodSpec {
+        name: &name,
+        namespace: options.namespace.as_deref(),
+        image: &format!("{repo}@{}", image.manifest_digest),
+        runtime_class: &options.runtime_class,
+        source: podspec::EMBEDDED_SOURCE,
+        output: options.output.as_deref(),
+        command: &options.command,
+    })
+}
+
+/// Nothing is packed here: the pod names the reference, and the node decides
+/// whether it may evaluate it. Everything this mode can check has already been
+/// checked by the parser, so the work left is choosing the pull target and
+/// saying plainly what the node still has to be configured to do.
+fn run_external(options: &RunOptions, reference: &str) -> ExitCode {
+    eprintln!(
+        "warning: --external moves trust from the image to the node: nothing is packed, so what\n\
+         runs is whatever the node evaluates from `{reference}`, fetched with the node's network\n\
+         and credentials. Inputs the referenced flake leaves unlocked resolve at evaluation time."
+    );
+    eprintln!(
+        "notice: the node must have evaluation enabled (cache_only: false) and an\n\
+         eval_allowed_uri_prefixes entry matching this reference — ask the node operator for\n\
+         `{}`, which is matched as a literal byte prefix and authorizes every reference\n\
+         beginning with those bytes.",
+        flakeref::policy_prefix(reference)
+    );
+    // With a placeholder a dropped annotation fails the create loudly; with a
+    // borrowed image the pod silently runs that image instead. The operator
+    // must know which of the two they bought.
+    let tail = match &options.image {
+        Some(image) => format!("the pod silently runs `{image}` instead"),
+        None => "the container fails to create with the placeholder's own diagnosis".to_string(),
+    };
+    eprintln!(
+        "notice: the containerd runtime handler must also pass run.imageless.* through\n\
+         (pod_annotations and container_annotations); a handler configured only for\n\
+         imageless.run/* drops the annotation and {tail}. `kubectl imageless doctor` reports\n\
+         whether this cluster is prepared."
+    );
+    if options.unpinned {
+        eprintln!("warning: {}", flakeref::unpinned_diagnostic(reference));
+    }
+
+    let pod_image = match (&options.image, &options.repo) {
+        (Some(image), _) => {
+            eprintln!(
+                "notice: --image `{image}` is used verbatim; nothing here checks the node can pull\n\
+                 it, and its config's Env, User and WorkingDir still reach the container."
+            );
+            if !image.contains("@sha256:") {
+                eprintln!(
+                    "notice: --image `{image}` is not digest-pinned; the pod's only pinned\n\
+                     identity is the flake reference."
+                );
+            }
+            image.clone()
+        }
+        (None, Some(repo)) => {
+            let image = oci::assemble(placeholder::layer(), &options.arch);
+            report_digests(&image);
+            eprintln!(
+                "notice: the image is a placeholder — Kubernetes requires one and the node replaces\n\
+                 the root filesystem. It carries no process metadata, only a flake that fails the\n\
+                 container create with a diagnosis if run.imageless.source never reaches the runtime."
+            );
+            if !options.dry_run {
+                if let Err(error) = push(options, repo, &image) {
+                    return fail(error);
+                }
+            }
+            format!("{repo}@{}", image.manifest_digest)
+        }
+        // The parser refuses this combination; reaching it is a bug here.
+        (None, None) => return fail("--external needs --repo or --image".to_string()),
+    };
+
+    let name = options
+        .name
+        .clone()
+        .unwrap_or_else(|| flakeref::derive_name(reference));
+    emit(&podspec::PodSpec {
+        name: &name,
+        namespace: options.namespace.as_deref(),
+        image: &pod_image,
+        runtime_class: &options.runtime_class,
+        source: reference,
+        output: options.output.as_deref(),
+        command: &options.command,
+    })
+}
+
+/// stdout is exactly one JSON document, so it pipes into `kubectl apply -f -`.
+fn emit(spec: &podspec::PodSpec) -> ExitCode {
+    match podspec::pod(spec) {
+        Ok(pod) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&pod).expect("pod manifest serializes")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
+    }
+}
+
+fn report_digests(image: &oci::SeedImage) {
     eprintln!(
         "layer    {} ({} bytes)",
         image.layer_digest,
@@ -256,42 +512,25 @@ fn run(options: &RunOptions) -> ExitCode {
         image.manifest_digest,
         image.manifest.len()
     );
-    if !options.dry_run {
-        if let Err(error) = push(options, &image) {
-            return fail(error);
-        }
-    }
+}
 
-    let name = options
-        .name
-        .clone()
-        .unwrap_or_else(|| podspec::derive_name(&options.source));
-    let reference = format!("{}@{}", options.repo, image.manifest_digest);
-    let pod = podspec::seed_pod(&podspec::PodSpec {
-        name: &name,
-        namespace: options.namespace.as_deref(),
-        image: &reference,
-        runtime_class: &options.runtime_class,
-        output: options.output.as_deref(),
-        command: &options.command,
-    });
-    match pod {
-        Ok(pod) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&pod).expect("pod manifest serializes")
-            );
-            ExitCode::SUCCESS
-        }
-        Err(error) => fail(error),
-    }
+/// A reference typed without `--external` fails as a missing directory, which
+/// is true but unhelpful. "Looks like a reference" is defined as "the node
+/// would accept it as one", so the hint cannot point at something `--external`
+/// would then refuse.
+fn packing_failure_hint(source: &Path) -> Option<String> {
+    (!source.exists() && flakeref::looks_like_reference(&source.to_string_lossy())).then(|| {
+        "hint: that looks like a flake reference — pass --external to deploy it as one\n\
+         (the node evaluates it under node policy; nothing is packed)"
+            .to_string()
+    })
 }
 
 /// Blobs before the manifest — the spec lets a registry reject a manifest
 /// whose descriptors it cannot resolve. Every byte buffer uploads verbatim:
 /// the digests were computed over exactly these bytes, never a re-encoding.
-fn push(options: &RunOptions, image: &oci::SeedImage) -> Result<(), String> {
-    let mut registry = registry::Registry::connect(&options.repo, options.plain_http)?;
+fn push(options: &RunOptions, repo: &str, image: &oci::SeedImage) -> Result<(), String> {
+    let mut registry = registry::Registry::connect(repo, options.plain_http)?;
     registry.ensure_blob(&image.layer_digest, &image.layer)?;
     registry.ensure_blob(&image.config_digest, &image.config)?;
     registry.put_manifest(
@@ -305,12 +544,12 @@ fn push(options: &RunOptions, image: &oci::SeedImage) -> Result<(), String> {
         // the seed. The pod reference stays digest-pinned regardless.
         registry.put_manifest(tag, oci::MANIFEST_MEDIA_TYPE, &image.manifest)?;
         eprintln!(
-            "pushed {}@{} (also tagged {}:{tag})",
-            options.repo, image.manifest_digest, options.repo
+            "pushed {repo}@{} (also tagged {repo}:{tag})",
+            image.manifest_digest
         );
         return Ok(());
     }
-    eprintln!("pushed {}@{}", options.repo, image.manifest_digest);
+    eprintln!("pushed {repo}@{}", image.manifest_digest);
     Ok(())
 }
 
@@ -331,6 +570,20 @@ mod tests {
         match parse_run(&arguments(words))? {
             ParsedRun::Run(options) => Ok(*options),
             ParsedRun::Help => panic!("unexpected help request"),
+        }
+    }
+
+    fn directory(options: &RunOptions) -> &Path {
+        match &options.source {
+            Source::Directory(directory) => directory,
+            Source::External(reference) => panic!("expected a directory, got `{reference}`"),
+        }
+    }
+
+    fn external(options: &RunOptions) -> &str {
+        match &options.source {
+            Source::External(reference) => reference,
+            Source::Directory(directory) => panic!("expected a reference, got {directory:?}"),
         }
     }
 
@@ -360,8 +613,8 @@ mod tests {
             "--port=8080",
         ])
         .unwrap();
-        assert_eq!(options.source, PathBuf::from("./app"));
-        assert_eq!(options.repo, "registry.example/team/app");
+        assert_eq!(directory(&options), Path::new("./app"));
+        assert_eq!(options.repo.as_deref(), Some("registry.example/team/app"));
         assert_eq!(options.name.as_deref(), Some("demo"));
         assert_eq!(options.namespace.as_deref(), Some("staging"));
         assert_eq!(options.runtime_class, "imageless-arm");
@@ -396,6 +649,151 @@ mod tests {
         );
     }
 
+    const REV: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn external_mode_is_chosen_by_the_flag_never_by_the_argument() {
+        // A reference typed without the flag is a directory that does not
+        // exist — not a silent switch to node-evaluated deployment.
+        let packed = parse(&["github:o/r", "--repo", "r.example/a", "--", "/x"]).unwrap();
+        assert_eq!(directory(&packed), Path::new("github:o/r"));
+
+        let reference = format!("github:o/r/{REV}");
+        let options = parse(&[
+            "--external",
+            &reference,
+            "--repo",
+            "r.example/a",
+            "--",
+            "/x",
+        ])
+        .unwrap();
+        assert_eq!(external(&options), reference);
+    }
+
+    #[test]
+    fn an_unpinned_reference_needs_the_opt_out() {
+        let error = parse(&[
+            "--external",
+            "github:o/r",
+            "--repo",
+            "r.example/a",
+            "--",
+            "/x",
+        ])
+        .unwrap_err();
+        assert!(error.contains("is not pinned"), "{error}");
+        assert!(error.contains("--unpinned"), "{error}");
+        let options = parse(&[
+            "--external",
+            "github:o/r",
+            "--repo",
+            "r.example/a",
+            "--unpinned",
+            "--",
+            "/x",
+        ])
+        .unwrap();
+        assert!(options.unpinned);
+    }
+
+    #[test]
+    fn external_needs_exactly_one_image_source() {
+        let neither = parse(&["--external", &format!("github:o/r/{REV}"), "--", "/x"]).unwrap_err();
+        assert!(neither.contains("--repo HOST/REPO to push"), "{neither}");
+        let both = parse(&[
+            "--external",
+            &format!("github:o/r/{REV}"),
+            "--repo",
+            "r.example/a",
+            "--image",
+            "pause:3.10",
+            "--",
+            "/x",
+        ])
+        .unwrap_err();
+        assert!(both.contains("not both"), "{both}");
+    }
+
+    #[test]
+    fn image_mode_validates_no_repository_and_pushes_nothing() {
+        let options = parse(&[
+            "--external",
+            &format!("github:o/r/{REV}"),
+            "--image",
+            "registry.k8s.io/pause:3.10",
+            "--",
+            "/x",
+        ])
+        .unwrap();
+        assert_eq!(options.repo, None);
+        assert_eq!(options.image.as_deref(), Some("registry.k8s.io/pause:3.10"));
+    }
+
+    #[test]
+    fn mode_specific_flags_are_refused_rather_than_ignored() {
+        let pinned = format!("github:o/r/{REV}");
+        for (words, expected) in [
+            (
+                vec!["./app", "--repo", "r.example/a", "--image", "x", "--", "/x"],
+                "--image applies to --external",
+            ),
+            (
+                vec!["./app", "--repo", "r.example/a", "--unpinned", "--", "/x"],
+                "--unpinned applies to --external",
+            ),
+            (
+                vec![
+                    "--external",
+                    &pinned,
+                    "--repo",
+                    "r.example/a",
+                    "--include-vcs",
+                    "--",
+                    "/x",
+                ],
+                "--include-vcs applies to a packed directory",
+            ),
+            (
+                vec![
+                    "--external",
+                    &pinned,
+                    "--image",
+                    "x",
+                    "--tag",
+                    "v1",
+                    "--",
+                    "/x",
+                ],
+                "--tag applies to the manifest this command pushes",
+            ),
+            (
+                vec![
+                    "--external",
+                    &pinned,
+                    "--image",
+                    "x",
+                    "--plain-http",
+                    "--",
+                    "/x",
+                ],
+                "--plain-http applies to the manifest this command pushes",
+            ),
+        ] {
+            let error = parse(&words).unwrap_err();
+            assert!(error.contains(expected), "{words:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn external_reports_the_missing_positional_in_its_own_words() {
+        let error = parse(&["--external", "--repo", "r.example/a", "--", "/x"]).unwrap_err();
+        assert!(
+            error.contains("external flake reference is required"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn repo_must_be_a_bare_host_repo_reference() {
         for repo in [
@@ -418,7 +816,7 @@ mod tests {
     #[test]
     fn repo_keeps_a_port_on_the_host() {
         let options = parse(&["./app", "--repo", "localhost:5001/app", "--", "/bin/true"]).unwrap();
-        assert_eq!(options.repo, "localhost:5001/app");
+        assert_eq!(options.repo.as_deref(), Some("localhost:5001/app"));
     }
 
     #[test]
