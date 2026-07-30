@@ -210,6 +210,24 @@ at authoring or apply time. Nodes MUST ignore the index: the annotation a node
 accepts is always digest-addressed, and node-side resolution of mutable
 pointers is non-conforming.
 
+A pointer is **64 lowercase hexadecimal digits**, optionally surrounded by
+whitespace, and nothing else — not JSON, and carrying no metadata. Readers MUST
+reject anything else, including uppercase hex, a `sha256:` prefix, or a second
+line. A pointer is the one file in this design a publisher rewrites in place,
+so the format is deliberately too small to grow a schema: a field added here
+would be a field a client must interpret to decide what to deploy, which is
+exactly the mutable, evaluated deployment identity the release profile exists
+to avoid. Metadata about a release belongs in the manifest, whose bytes are
+covered by the digest. Readers SHOULD bound the read (the reference
+implementation stops at 128 bytes), since the file is served by whatever host
+publishes the catalog.
+
+The index is *conventional*, not authoritative: republishing a channel changes
+what future `pin` calls resolve to and never what an existing pod runs, because
+the pod records the digest. Nothing verifies that a pointer names a manifest
+the catalog actually holds — a client learns that when the fetch of
+`sha256/<digest>.json` fails.
+
 The publisher that produces manifests is out of scope for this spec; any CI
 that can copy a Nix closure to a cache and emit the manifest JSON conforms.
 

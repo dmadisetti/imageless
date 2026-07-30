@@ -1,7 +1,26 @@
 # A generic digest-addressed imageless workload. The CRI image is only a tiny
 # placeholder; the authorized release supplies rootfs and image-like process
-# metadata. The reference is issuer/name@sha256:<digest of the canonical
-# release manifest> as published by your CI.
+# metadata.
+#
+# The digest below was not typed by hand, and yours should not be either.
+# Produce this whole manifest from a channel name:
+#
+#   kubectl imageless run --release example/agent \
+#     --catalog https://releases.example.com \
+#     --image localhost/imageless-placeholder:v1 -- /bin/agent
+#
+# or resolve just the reference, to substitute into a manifest you keep in git:
+#
+#   kubectl imageless pin example/agent --catalog https://releases.example.com
+#   # -> example/agent@sha256:306160dad905c288a22399c412a15bf4ba198f2bd49b8fc42cc3417173395072
+#
+# Publishers building the catalog with Nix get the same string from
+# `nix/release-catalog.nix` as `passthru.reference`, so a release pipeline can
+# template it in without a round trip through a client.
+#
+# Pinning happens at authoring time, on purpose: republishing the channel
+# changes what the next `pin` returns and never what this pod runs. Nodes
+# resolve digests only — a channel name in the annotation below is refused.
 #
 # The runtime handler must pass `imageless.run/*` pod annotations.
 apiVersion: v1
@@ -9,9 +28,7 @@ kind: Pod
 metadata:
   name: imageless-agent
   annotations:
-    # Pinned at apply time by tooling (e.g. your CI's release publisher), not
-    # typed by hand; nodes only accept digest-addressed references.
-    imageless.run/release-v1: example/agent@sha256:REPLACE_DIGEST
+    imageless.run/release-v1: example/agent@sha256:306160dad905c288a22399c412a15bf4ba198f2bd49b8fc42cc3417173395072
     imageless.run/containers-v1: agent
 spec:
   runtimeClassName: imageless
