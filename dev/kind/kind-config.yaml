@@ -1,10 +1,12 @@
 # A kind cluster whose node carries the imageless containerd runtime entry.
 #
-# Requires kind >= 0.27: those nodes ship containerd 2.x (config version 3),
-# where the CRI runtime table is plugins.'io.containerd.cri.v1.runtime'. A
-# grpc.v1.cri-shaped patch (the containerd 1.x table, see
-# examples/containerd-config-v2.toml) merged into a version-3 config is
-# silently dead.
+# Requires kind >= 0.27, whose nodes ship containerd 2.x. Those nodes still
+# WRITE a `version = 2` config that declares kind's own runtimes under
+# plugins."io.containerd.grpc.v1.cri"; containerd migrates it at load. A patch
+# written against the 2.x table (plugins.'io.containerd.cri.v1.runtime', the
+# shape examples/containerd-config.toml uses) survives that migration with its
+# options intact — confirmed on kind 0.31 / containerd 2.2.0 by reading back
+# `containerd config dump`, which is the only place the merge is observable.
 #
 # The patch mirrors the runtime body of examples/containerd-config.toml and
 # is applied at node CREATION — changing it means recreating the cluster.
@@ -24,6 +26,14 @@ containerdConfigPatches:
       container_annotations = ["imageless.run/*"]
       [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.imageless.options]
         BinaryName = "/usr/local/bin/imageless-runc"
-        SystemdCgroup = true
+        # false here, true in examples/containerd-config.toml. Not drift: this
+        # field tracks the node's cgroup driver, and a kind node resolves its
+        # own runc handler to false. Setting true on a cgroupfs node makes
+        # containerd format a cgroupfs cgroupsPath while telling runc to expect
+        # systemd's "slice:prefix:name", and every pod on this handler fails to
+        # create — the sandbox never starts, so the failure arrives as
+        # FailedCreatePodSandBox with no imageless diagnostic at all. Production
+        # nodes are systemd-managed and want true.
+        SystemdCgroup = false
 nodes:
   - role: control-plane

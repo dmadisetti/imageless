@@ -742,12 +742,43 @@
                     plugins = config["plugins"]["io.containerd.cri.v1.runtime"]
                     return plugins["containerd"]["runtimes"]["imageless"]
 
-                patch = tomllib.loads(pathlib.Path("patch.toml").read_text())
-                example = tomllib.loads(
-                    (source / "examples/containerd-config.toml").read_text()
+                # SystemdCgroup is the one field that legitimately differs, and
+                # comparing it was what made the correct kind config
+                # unrepresentable: it tracks the node's cgroup driver, which is
+                # a property of the node rather than of the imageless contract.
+                # A kind node resolves its own runc handler to cgroupfs; a
+                # production node is systemd-managed. Mismatch it and the
+                # sandbox never starts, so neither file may leave it to a
+                # default.
+                def driver(table, origin):
+                    options = dict(table["options"])
+                    assert "SystemdCgroup" in options, (
+                        f"{origin} must state SystemdCgroup, not inherit it"
+                    )
+                    setting = options.pop("SystemdCgroup")
+                    return {**table, "options": options}, setting
+
+                patch, patch_driver = driver(
+                    runtime(tomllib.loads(pathlib.Path("patch.toml").read_text())),
+                    "dev/kind/kind-config.yaml",
                 )
-                assert runtime(patch) == runtime(example), (
+                example, example_driver = driver(
+                    runtime(
+                        tomllib.loads(
+                            (source / "examples/containerd-config.toml").read_text()
+                        )
+                    ),
+                    "examples/containerd-config.toml",
+                )
+                assert patch == example, (
                     "dev/kind patch drifted from examples/containerd-config.toml"
+                )
+                assert patch_driver is False, (
+                    "a kind node is cgroupfs: dev/kind must set SystemdCgroup = false"
+                )
+                assert example_driver is True, (
+                    "a production node is systemd-managed: "
+                    "examples/containerd-config.toml must set SystemdCgroup = true"
                 )
                 PY
                 touch $out

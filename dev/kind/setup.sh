@@ -57,6 +57,15 @@ docker exec "$node" mkdir -p /nix/var/nix/gcroots
 # Protect the shim's own closure from node-side GC; workload closures are
 # protected per bundle by the runtime itself.
 docker exec "$node" ln -sfn "$build" /nix/var/nix/gcroots/imageless-runc
+# The nix the shim drives lives in a different store path than the shim, and
+# the node has no other one: `.#imageless`'s bin carries the four imageless
+# binaries and no nix-store. Rooting it under a stable name is what lets the
+# documented node-side GC name an interpreter that exists.
+#
+# eval, not build: the binary only has to exist in the NODE's imported closure,
+# and outPath sidesteps the package's extra outputs (man).
+node_nix="$(nix eval --raw "$repo#imageless.materializerNix.outPath")"
+docker exec "$node" ln -sfn "$node_nix" /nix/var/nix/gcroots/imageless-nix
 docker exec "$node" ln -sfn "$build/bin/imageless-runc" /usr/local/bin/imageless-runc
 # Daemonless root nix inside the node: no build users, no sandbox (the node
 # is already a privileged container, and the quickstart substitutes rather
@@ -79,16 +88,13 @@ kubectl label node "$node" imageless.run/runtime=v2 --overwrite
 
 if [ "$prewarm" = 1 ]; then
   echo "==> prewarming: realizing the nginx-embedded rootfs on the node"
-  # eval, not build: the binary only has to exist in the NODE's imported
-  # closure, and outPath sidesteps the package's extra outputs (man).
-  node_nix="$(nix eval --raw "$repo#imageless.materializerNix.outPath")/bin/nix"
   docker exec "$node" rm -rf /root/imageless-prewarm
   docker exec "$node" mkdir -p /root/imageless-prewarm
   tar -C "$repo/examples" -c nginx-embedded | docker exec -i "$node" tar -C /root/imageless-prewarm -x
   # --out-link registers an indirect GC root, so the prewarmed rootfs
   # survives node-side GC until the first pod takes its own bundle root.
   docker exec -e NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt "$node" \
-    "$node_nix" build --out-link /root/imageless-prewarm/result \
+    "$node_nix/bin/nix" build --out-link /root/imageless-prewarm/result \
     "path:/root/imageless-prewarm/nginx-embedded#rootfs"
 fi
 

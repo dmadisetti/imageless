@@ -68,8 +68,10 @@ auto-discovered and selects the container, with source `/etc/imageless` and the
 runtime's default output (`rootfs`, see `IMAGELESS_DEFAULT_OUTPUT`). That is
 the zero-config path — an image with no such file is passed straight through to
 stock runc, untouched. Deployer-side overrides (a different source, a different
-output, per-container selection) are annotations only; when they are present,
-discovery is skipped. See [SPEC.md](SPEC.md) for the annotation set.
+output, per-container selection) are annotations only. Naming a *source* — a
+release or an external flake reference — replaces discovery; the output and
+per-container selectors refine whatever was discovered rather than suppressing
+it. See [SPEC.md](SPEC.md) for the annotation set.
 
 No daemon. The shim materializes in-process by node policy. Multi-tenant
 nodes can instead run the optional `imageless-resolver` daemon (selected via
@@ -323,8 +325,10 @@ convenience, gated so a node operator can keep them off entirely.
 
 ## Embedding the library
 
-The shim is a ~200-line consumer of the `imageless` crate. A runtime that owns
-its `create` path can skip the interposer entirely:
+The shim is a thin consumer of the `imageless` crate — argv parsing, telemetry
+export, and a delegation to real runc; every decision it makes lives in the
+library. A runtime that owns its `create` path can skip the interposer
+entirely:
 
 ```rust
 use imageless::{prepare_bundle, remove_bundle_gc_roots, PrepareBundle};
