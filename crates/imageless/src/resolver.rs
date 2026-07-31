@@ -194,12 +194,22 @@ fn in_process_policy(
     }
 }
 
-fn default_policy_hint(error: ResolutionError, default_path: &Path) -> ResolutionError {
+/// Where a diagnostic stops addressing whoever owns the workload and starts
+/// addressing whoever configures the node.
+///
+/// Everything from this marker onward names a node-local path and a node-local
+/// remedy: true, useful, and meaningless to a tenant who cannot act on it and
+/// should not be handed the node's filesystem layout. [`default_policy_hint`]
+/// is the only producer, and it appends beginning exactly here, so the relay
+/// into the runtime log can cut at one shared constant rather than guess.
+pub(crate) const OPERATOR_HINT: &str = "; node policy does not permit this";
+
+pub(crate) fn default_policy_hint(error: ResolutionError, default_path: &Path) -> ResolutionError {
     match error.category {
         ErrorCategory::EvaluationDisabled | ErrorCategory::PolicyDenied => ResolutionError::new(
             error.category,
             format!(
-                "{}; node policy does not permit this — write {} to authorize releases or development sources",
+                "{}{OPERATOR_HINT} — write {} to authorize releases or development sources",
                 error.diagnostic,
                 default_path.display()
             ),

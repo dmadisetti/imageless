@@ -77,6 +77,50 @@ fn subcommand_index(arguments: &[String]) -> Option<usize> {
     None
 }
 
+/// Value of a global flag — one that precedes the subcommand — in either
+/// spelling runc accepts. The search stops at the subcommand so that a
+/// `create --log-format ...` never answers for the global one, and so that a
+/// container ID that happens to spell a flag is never read as one.
+fn global_flag<'a>(arguments: &'a [String], flag: &str) -> Option<&'a str> {
+    let end = subcommand_index(arguments).unwrap_or(arguments.len());
+    let mut index = 0;
+    while index < end {
+        let argument = arguments[index].as_str();
+        if argument == flag {
+            return arguments.get(index + 1).map(String::as_str);
+        }
+        if let Some(value) = argument
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            return Some(value);
+        }
+        index += if GLOBAL_VALUE_FLAGS.contains(&argument) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
+/// The runtime log to relay a create failure into, if the caller established
+/// one this shim can safely append to.
+///
+/// Both conditions are the caller's, not ours: containerd passes `--log` with
+/// `--log-format json` on every invocation, while a human running `runc` by
+/// hand gets runc's default text format. Writing a JSON record into a text log
+/// would corrupt the operator's file to no one's benefit, so the absent format
+/// flag means silence rather than a guess.
+fn runtime_log(arguments: &[String]) -> Option<PathBuf> {
+    if global_flag(arguments, "--log-format") != Some("json") {
+        return None;
+    }
+    global_flag(arguments, "--log")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
 fn create_bundle(arguments: &[String]) -> Result<Option<PathBuf>, String> {
     let Some(create_index) = subcommand_index(arguments) else {
         return Ok(None);
@@ -150,6 +194,10 @@ fn main() {
         let mut prepare = PrepareBundle::new(bundle.join("config.json"), bundle);
         prepare.default_output = default_output();
         prepare.timeout_seconds = timeout_seconds().unwrap_or_else(|error| fail(error, 1));
+        // Parsed here rather than inside the library: argv is this binary's
+        // contract with the runtime that invoked it, and the library serves
+        // embedders that have no argv at all.
+        prepare.runtime_log = runtime_log(&arguments);
         let prepare_started = Instant::now();
         let resolution = prepare_bundle(&prepare).unwrap_or_else(|error| {
             // The sink recorded successes only: every failure exited here,
@@ -234,11 +282,113 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::create_bundle;
+    use super::{create_bundle, runtime_log};
     use std::path::PathBuf;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// containerd's actual invocation, which is the only one that should turn
+    /// the relay on.
+    #[test]
+    fn a_json_runtime_log_is_taken_in_either_spelling() {
+        let expected = Some(PathBuf::from(
+            "/run/containerd/io.containerd.runtime/log.json",
+        ));
+        assert_eq!(
+            runtime_log(&args(&[
+                "--root",
+                "/run/runc",
+                "--log",
+                "/run/containerd/io.containerd.runtime/log.json",
+                "--log-format",
+                "json",
+                "create",
+                "--bundle",
+                "/b",
+                "id",
+            ])),
+            expected
+        );
+        assert_eq!(
+            runtime_log(&args(&[
+                "--log=/run/containerd/io.containerd.runtime/log.json",
+                "--log-format=json",
+                "create",
+                "id",
+            ])),
+            expected
+        );
+    }
+
+    /// runc's default format is text, and a JSON record written into a text log
+    /// corrupts an operator's file to no one's benefit.
+    #[test]
+    fn a_log_without_the_json_format_is_not_relayed_into() {
+        assert_eq!(
+            runtime_log(&args(&["--log", "/var/log/runc.log", "create", "id"])),
+            None
+        );
+        assert_eq!(
+            runtime_log(&args(&[
+                "--log",
+                "/var/log/runc.log",
+                "--log-format",
+                "text",
+                "create",
+                "id"
+            ])),
+            None
+        );
+        // The flag with no path behind it is a malformed invocation, not a
+        // reason to write somewhere.
+        assert_eq!(runtime_log(&args(&["--log-format", "json", "--log"])), None);
+        assert_eq!(
+            runtime_log(&args(&[
+                "--log",
+                "",
+                "--log-format",
+                "json",
+                "create",
+                "id"
+            ])),
+            None
+        );
+    }
+
+    /// The same positional reasoning `subcommand_index` exists for: a container
+    /// ID or bundle path that spells a global flag belongs to the subcommand,
+    /// and reading it as the runtime log would point the relay at a path the
+    /// runtime never established.
+    #[test]
+    fn a_subcommand_argument_that_spells_a_global_flag_is_not_the_runtime_log() {
+        assert_eq!(
+            runtime_log(&args(&[
+                "--log-format",
+                "json",
+                "create",
+                "--bundle",
+                "/b",
+                "--log",
+                "/attacker/owned",
+            ])),
+            None
+        );
+        // And a global flag still wins when a later subcommand argument repeats
+        // it, because the search stops at the subcommand.
+        assert_eq!(
+            runtime_log(&args(&[
+                "--log",
+                "/run/real.json",
+                "--log-format",
+                "json",
+                "create",
+                "--log",
+                "/decoy",
+            ])),
+            Some(PathBuf::from("/run/real.json"))
+        );
     }
 
     #[test]

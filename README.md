@@ -401,6 +401,36 @@ A create that *fails* now appends a single `preparation` event with outcome
 recorded nothing at all. The duration separates a fast refusal, like a policy
 denial, from a create that burned its whole deadline.
 
+### Failures the workload's owner can see
+
+Telemetry is node-owned, and so is every other channel a failed create used to
+write to: a pod that would not start said `CreateContainerError` and nothing
+more, and the reason lived on the node. When the calling runtime passes both
+`--log` and `--log-format json` — as containerd does on every invocation —
+`imageless-runc` appends one JSON record to that log on a terminal create
+failure. containerd reads it back and surfaces it as an event, so
+`kubectl describe pod` shows the category and a curated diagnostic:
+
+```text
+Warning  Failed  kubelet  Error: imageless: architecture_mismatch: release
+                          targets aarch64-linux; this node is x86_64-linux
+```
+
+The category is the same string the telemetry record carries, so a pod event
+and a node timing record can be matched by eye. The diagnostic is *curated*:
+where a message continues into node-local remedies — "write
+`/etc/imageless/policy.json` to authorize…" — the relay stops at that boundary.
+The tenant learns why their pod will not start; they do not learn the node's
+filesystem layout, and there is nothing in the relayed line they could not have
+worked out from their own pod spec.
+
+The relay writes nothing on success, nothing on a passthrough bundle (SPEC §4.1
+makes that a strict no-op, and a log line is observable), and nothing when the
+runtime asked for the default text log format — a JSON record in a text log
+would corrupt an operator's file to no one's benefit. Write failures are
+ignored: a create that has already failed is not improved by failing
+differently.
+
 Client-side, read only by `kubectl-imageless`:
 
 | Variable | Default | What it does |
@@ -433,6 +463,8 @@ Internal / development only:
   and pod authoring with zero client-side Nix.
 - `SPEC.md` — the contract.
 - `examples/`, `smoke/` — deployment examples and the acceptance smokes.
+- `dev/bench` — the redeploy benchmark: what one edit costs on the real create
+  path, decomposed into staging, Nix evaluation, and compilation.
 
 ## Status and limitations
 
