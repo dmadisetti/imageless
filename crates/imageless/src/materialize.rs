@@ -74,6 +74,34 @@ pub enum ErrorCategory {
     CacheQuery,
 }
 
+impl ErrorCategory {
+    /// The wire spelling, for the places a category has to sit inside a line of
+    /// prose rather than in a JSON field of its own. A test holds this in step
+    /// with the `snake_case` rename above, because a reader correlating a pod
+    /// event against a telemetry record matches these strings by eye.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Protocol => "protocol",
+            Self::Unauthorized => "unauthorized",
+            Self::InvalidRequest => "invalid_request",
+            Self::Unavailable => "unavailable",
+            Self::Overloaded => "overloaded",
+            Self::Timeout => "timeout",
+            Self::Materialization => "materialization",
+            Self::RootCollision => "root_collision",
+            Self::RootRegistration => "root_registration",
+            Self::Internal => "internal",
+            Self::ManifestFetch => "manifest_fetch",
+            Self::DigestMismatch => "digest_mismatch",
+            Self::PolicyDenied => "policy_denied",
+            Self::ArchitectureMismatch => "architecture_mismatch",
+            Self::SpecConflict => "spec_conflict",
+            Self::EvaluationDisabled => "evaluation_disabled",
+            Self::CacheQuery => "cache_query",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ResolutionError {
     pub category: ErrorCategory,
@@ -283,6 +311,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded.substitution_us, 2);
+    }
+
+    /// `as_str` is a second spelling of the same category, and two spellings
+    /// drift. A pod event carries one and a telemetry record the other, so a
+    /// reader correlating them is relying on this holding.
+    #[test]
+    fn every_category_spells_itself_as_it_serializes() {
+        for category in [
+            ErrorCategory::Protocol,
+            ErrorCategory::Unauthorized,
+            ErrorCategory::InvalidRequest,
+            ErrorCategory::Unavailable,
+            ErrorCategory::Overloaded,
+            ErrorCategory::Timeout,
+            ErrorCategory::Materialization,
+            ErrorCategory::RootCollision,
+            ErrorCategory::RootRegistration,
+            ErrorCategory::Internal,
+            ErrorCategory::ManifestFetch,
+            ErrorCategory::DigestMismatch,
+            ErrorCategory::PolicyDenied,
+            ErrorCategory::ArchitectureMismatch,
+            ErrorCategory::SpecConflict,
+            ErrorCategory::EvaluationDisabled,
+            ErrorCategory::CacheQuery,
+        ] {
+            let serialized = serde_json::to_string(&category).unwrap();
+            assert_eq!(serialized, format!("\"{}\"", category.as_str()));
+        }
     }
 
     /// The zero-elision is what keeps an all-default `timings` off the wire, so

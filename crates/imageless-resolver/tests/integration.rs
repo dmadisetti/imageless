@@ -612,6 +612,93 @@ fn a_failed_create_records_an_error_event_where_it_previously_recorded_nothing()
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Telemetry is node-owned; a pod that will not start says `CreateContainerError`
+/// and the reason lives somewhere its owner cannot read. Unit tests cover the
+/// record's shape and its curation — this one proves the shim's argv parsing and
+/// the library's writer actually meet, over the real binary, with the flags
+/// containerd passes.
+#[test]
+fn a_failed_create_relays_its_reason_into_the_runtime_log() {
+    let dir = temp_dir("failed-relay");
+    let release = TestRelease::new(&dir);
+    let bundle = dir.join("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+    write_config(
+        &bundle,
+        serde_json::json!({
+            "imageless.run/release-v1": release.reference.replacen("test/", "other/", 1)
+        }),
+    );
+    let nix = dir.join("nix");
+    fake_nix(&nix, "true");
+    let delegate = dir.join("delegate");
+    let called = dir.join("called");
+    executable(&delegate, "touch \"$CALLED\"");
+    let log = dir.join("runtime.log");
+    let resolver = ResolverProcess::start(&dir, &nix, &release.policy);
+
+    let output = Command::new(runc_binary())
+        .env("IMAGELESS_RUNC", &delegate)
+        .env("IMAGELESS_RESOLVER_SOCKET", &resolver.socket)
+        .env("CALLED", &called)
+        .args(["--root", "/run/runc-test", "--log"])
+        .arg(&log)
+        .args(["--log-format", "json", "create", "--bundle"])
+        .arg(&bundle)
+        .arg("integration-test")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!called.exists(), "a refused create must not reach runc");
+
+    let records = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["level"], "error");
+    let message = records[0]["msg"].as_str().unwrap();
+    // containerd renders this into a pod event, so it has to stay one line and
+    // it has to say which component refused before it says why.
+    assert!(message.starts_with("imageless: "), "{message}");
+    assert!(!message.contains('\n'), "{message}");
+
+    // The category is the same token the telemetry sink records, so an operator
+    // correlating a pod event with a node timing record matches strings by eye.
+    let category = message
+        .trim_start_matches("imageless: ")
+        .split_once(": ")
+        .expect("a category precedes the diagnostic")
+        .0
+        .to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("{}:", to_camel(&category))),
+        "log said {category}, stderr said {stderr}"
+    );
+
+    // Nothing in the relayed line is node configuration the tenant cannot act
+    // on — that half of a diagnostic stops at the curation boundary.
+    assert!(!message.contains("/etc/imageless"), "{message}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `policy_denied` as `ResolutionError`'s `Debug` spells it, for the one
+/// assertion that has to hold both spellings against each other.
+fn to_camel(snake: &str) -> String {
+    snake
+        .split('_')
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
 #[test]
 fn release_digest_policy_and_architecture_errors_are_categorized() {
     for (label, configure, expected) in [

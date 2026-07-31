@@ -81,6 +81,13 @@ pub struct PrepareBundle {
     /// Materialization deadline in seconds (SPEC §4.3, 1–3600).
     pub timeout_seconds: u64,
     pub materializer: MaterializerConfig,
+    /// The runtime log the calling OCI runtime was given (`runc --log`), when
+    /// it was also given `--log-format json`. containerd reads this file back
+    /// when the runtime fails, which is the one channel by which a create
+    /// failure becomes an event on the pod instead of a line the workload's
+    /// owner can never see. `None` disables the relay, and is the default:
+    /// nothing is written unless a caller opts in with a path it parsed itself.
+    pub runtime_log: Option<PathBuf>,
 }
 
 impl PrepareBundle {
@@ -93,7 +100,97 @@ impl PrepareBundle {
             default_output: "rootfs".to_string(),
             timeout_seconds: 300,
             materializer: MaterializerConfig::from_environment(),
+            runtime_log: None,
         }
+    }
+}
+
+/// Bound on one relayed record. A pod event is read by a person in a terminal,
+/// and containerd carries the runtime's message into an event whose own limits
+/// are not ours to discover the hard way; a materialization diagnostic already
+/// arrives bounded (the Nix excerpt is capped upstream), so this is a backstop
+/// rather than the usual case.
+const MAX_RELAY_BYTES: usize = 2048;
+
+/// A logrus record in the shape `runc` writes and containerd's `go-runc` parses.
+/// `time` is deliberately absent: the parser treats it as optional, containerd
+/// stamps its own event, and a second clock in the line is one more thing that
+/// can disagree with the first.
+#[derive(Serialize)]
+struct RuntimeLogRecord<'a> {
+    level: &'static str,
+    msg: &'a str,
+}
+
+/// Trim a diagnostic to the half its reader can act on, and flatten it onto one
+/// line. See [`crate::resolver::OPERATOR_HINT`] for where the cut falls and why.
+fn tenant_diagnostic(diagnostic: &str) -> String {
+    let curated = match diagnostic.find(crate::resolver::OPERATOR_HINT) {
+        Some(cut) => diagnostic[..cut].trim_end(),
+        None => diagnostic,
+    };
+    // A pod event is one line in `kubectl describe`; a captured Nix tail is
+    // many. Collapsing runs of whitespace keeps a multi-line excerpt readable
+    // where it lands rather than where it was produced.
+    //
+    // Control bytes are dropped rather than escaped. JSON would carry them
+    // safely enough, but containerd decodes this back out and a person reads
+    // the result in a terminal — a build log excerpt is not a place to let ANSI
+    // escapes through. `nix.rs` already strips them from its excerpts; a
+    // diagnostic can be built anywhere, and this is the seam that leaves.
+    let flattened: String = curated
+        .chars()
+        .map(|character| {
+            if character.is_whitespace() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .filter(|character| !character.is_control())
+        .collect();
+    flattened.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Relay a terminal create failure into the runtime log, best-effort.
+///
+/// Writing is never allowed to change the outcome of a create that has already
+/// failed, so every error here is dropped: the caller is on its way to exiting
+/// non-zero regardless, and a telemetry-shaped side channel that can turn a
+/// clear failure into a confusing one is worse than no side channel.
+fn relay_failure(log: &Path, category: &ErrorCategory, diagnostic: &str) {
+    // The path comes from the runtime's own argv rather than from the image, so
+    // this guards against a malformed invocation, not against a tenant. The
+    // `O_NOFOLLOW` below is the part that matters: it refuses to be redirected
+    // through a symlink into a file the relay was never pointed at.
+    if !log.is_absolute() {
+        return;
+    }
+    let curated = tenant_diagnostic(diagnostic);
+    let mut message = format!("imageless: {}: {curated}", category.as_str());
+    if message.len() > MAX_RELAY_BYTES {
+        let mut cut = MAX_RELAY_BYTES - 3;
+        while !message.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        message.truncate(cut);
+        message.push_str("...");
+    }
+    let Ok(mut record) = serde_json::to_vec(&RuntimeLogRecord {
+        level: "error",
+        msg: &message,
+    }) else {
+        return;
+    };
+    record.push(b'\n');
+    let opened = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(log);
+    if let Ok(mut file) = opened {
+        let _ = file.write_all(&record);
     }
 }
 
@@ -131,26 +228,57 @@ pub struct AppliedResolution {
 /// Nix.
 pub fn prepare_bundle(prepare: &PrepareBundle) -> io::Result<Option<AppliedResolution>> {
     let selection_started = Instant::now();
-    let Some(request) = expansion_request(
+    let request = match expansion_request(
         &prepare.config_path,
         &prepare.bundle_path,
         &prepare.default_output,
         prepare.timeout_seconds,
-    )?
-    else {
-        return Ok(None);
+    ) {
+        Ok(Some(request)) => request,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            // `plan` is the only source of `InvalidInput` here, and it can only
+            // fail once the annotations have already identified the bundle as
+            // imageless: a `run.imageless.*` source alongside an
+            // `imageless.run/*` release (SPEC §3), an unparsable reference, an
+            // output attribute that is not a name. That is the most fixable
+            // failure a tenant can hit — it is in the pod spec they wrote —
+            // and the one they were least able to see.
+            //
+            // Every other kind here is the node's own: a config.json that will
+            // not parse, a rootfs that will not stat. Those name node paths,
+            // the tenant cannot act on them, and reaching this arm does not
+            // even establish that the bundle was imageless.
+            if error.kind() == io::ErrorKind::InvalidInput {
+                if let Some(log) = &prepare.runtime_log {
+                    relay_failure(log, &ErrorCategory::SpecConflict, &error.to_string());
+                }
+            }
+            return Err(error);
+        }
     };
     let selection_us = elapsed_us(selection_started);
-    let success = prepare
-        .materializer
-        .resolve(&request)
-        .map_err(|error| io::Error::other(format!("resolution failed: {error}")))?;
+    // Everything below has passed the passthrough gate above, so the relay can
+    // only ever touch a bundle this runtime was asked to expand. A bundle that
+    // is not imageless returned already, having had nothing written on its
+    // behalf — SPEC §4.1 makes passthrough a strict no-op, and a stray log line
+    // would be an observable one.
+    let success = prepare.materializer.resolve(&request).map_err(|error| {
+        if let Some(log) = &prepare.runtime_log {
+            relay_failure(log, &error.category, &error.diagnostic);
+        }
+        io::Error::other(format!("resolution failed: {error}"))
+    })?;
     let rewrite_started = Instant::now();
     if let Err(error) = apply_resolution(&prepare.config_path, &success.resolution) {
         let _ = remove_bundle_gc_roots(&prepare.bundle_path);
+        let diagnostic = error.to_string();
+        if let Some(log) = &prepare.runtime_log {
+            relay_failure(log, &ErrorCategory::SpecConflict, &diagnostic);
+        }
         return Err(io::Error::new(
             error.kind(),
-            format!("{:?}: {error}", ErrorCategory::SpecConflict),
+            format!("{:?}: {diagnostic}", ErrorCategory::SpecConflict),
         ));
     }
     Ok(Some(AppliedResolution {
@@ -436,6 +564,210 @@ mod tests {
     use crate::testutil::{temporary, STORE};
     use crate::NIX_STORE_PATH;
     use std::os::unix::fs::PermissionsExt;
+
+    fn relayed_lines(log: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line).expect("containerd parses this file line by line")
+            })
+            .collect()
+    }
+
+    /// The point of the relay: a create that failed for a reason the workload's
+    /// owner can act on says so where they can read it, in the shape
+    /// containerd's log parser expects.
+    #[test]
+    fn a_relayed_failure_is_one_json_error_record() {
+        let directory = temporary("relay-shape");
+        let log = directory.join("runtime.log");
+        relay_failure(
+            &log,
+            &ErrorCategory::ArchitectureMismatch,
+            "release targets aarch64-linux; this node is x86_64-linux",
+        );
+
+        let lines = relayed_lines(&log);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["level"], "error");
+        assert_eq!(
+            lines[0]["msg"],
+            "imageless: architecture_mismatch: release targets aarch64-linux; this node is x86_64-linux"
+        );
+        // containerd stamps its own event; a second clock is one more thing
+        // that can disagree with the first.
+        assert!(lines[0].get("time").is_none());
+    }
+
+    /// The curation dylan asked for. A tenant reading `kubectl describe pod`
+    /// learns why their pod will not start; they do not learn which file on
+    /// the node an operator would have to write to change that.
+    #[test]
+    fn a_policy_refusal_relays_its_reason_without_the_nodes_configuration_path() {
+        let directory = temporary("relay-curation");
+        let log = directory.join("runtime.log");
+        let refusal = crate::resolver::default_policy_hint(
+            ResolutionError::new(
+                ErrorCategory::EvaluationDisabled,
+                "development sources are not permitted",
+                false,
+            ),
+            Path::new("/etc/imageless/policy.json"),
+        );
+        // The operator-facing text is genuinely there before curation, or this
+        // test would pass against a diagnostic that never carried a path.
+        assert!(refusal.diagnostic.contains("/etc/imageless/policy.json"));
+
+        relay_failure(&log, &refusal.category, &refusal.diagnostic);
+
+        let message = relayed_lines(&log)[0]["msg"].as_str().unwrap().to_string();
+        assert_eq!(
+            message,
+            "imageless: evaluation_disabled: development sources are not permitted"
+        );
+        assert!(!message.contains("/etc/imageless"));
+        assert!(!message.contains("node policy does not permit"));
+    }
+
+    /// A materialization diagnostic can carry a captured Nix tail, which is
+    /// many lines and can be adversarial. A pod event is one line, and it is
+    /// not a place to discover containerd's own limits.
+    #[test]
+    fn a_hostile_diagnostic_relays_as_one_bounded_line() {
+        let directory = temporary("relay-bounds");
+        let log = directory.join("runtime.log");
+        let hostile = format!(
+            "nix said:\n{}\n\u{7}\u{1b}[31m",
+            "A".repeat(MAX_RELAY_BYTES * 4)
+        );
+        relay_failure(&log, &ErrorCategory::Materialization, &hostile);
+
+        let lines = relayed_lines(&log);
+        assert_eq!(lines.len(), 1, "the record must not become several");
+        let message = lines[0]["msg"].as_str().unwrap();
+        assert!(message.len() <= MAX_RELAY_BYTES, "{}", message.len());
+        assert!(!message.contains('\n'));
+        assert!(message.ends_with("..."));
+        // containerd decodes this back out and a person reads it in a terminal.
+        assert!(!message.chars().any(char::is_control), "{message}");
+    }
+
+    /// The runtime hands over this path; `O_NOFOLLOW` is what keeps a stale or
+    /// malformed invocation from writing through a symlink into a file the
+    /// relay was never pointed at.
+    #[test]
+    fn the_relay_refuses_a_symlinked_log_and_an_unanchored_one() {
+        let directory = temporary("relay-refusals");
+        let target = directory.join("elsewhere");
+        std::fs::write(&target, b"untouched").unwrap();
+        let link = directory.join("runtime.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        relay_failure(&link, &ErrorCategory::Internal, "a diagnostic");
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+
+        // A relative path is a malformed invocation, not a location to guess at
+        // from whatever directory the runtime happened to start in.
+        relay_failure(
+            Path::new("runtime.log"),
+            &ErrorCategory::Internal,
+            "a diagnostic",
+        );
+        assert!(!Path::new("runtime.log").exists());
+    }
+
+    /// The failure a tenant is most able to fix, because it is in the pod spec
+    /// they wrote: SPEC §3 makes the two annotation families mutually
+    /// exclusive. It fails in `expansion_request`, upstream of the materializer
+    /// the other relay sites sit behind, so it needs its own arm — and until
+    /// this one existed it was the loudest thing the tenant could not see.
+    #[test]
+    fn contradictory_annotations_relay_before_a_materializer_is_ever_reached() {
+        let directory = temporary("relay-spec-conflict");
+        let bundle = directory.join("bundle");
+        std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        let config = bundle.join("config.json");
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&serde_json::json!({
+                "ociVersion": "1.0.2",
+                "root": { "path": "rootfs" },
+                "annotations": {
+                    "imageless.run/release-v1": "example/agent@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "run.imageless.source": "/source"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let log = directory.join("runtime.log");
+
+        let mut prepare = PrepareBundle::new(&config, &bundle);
+        // Reaching a materializer at all would mean the conflict went unnoticed.
+        prepare.materializer =
+            MaterializerConfig::Socket(PathBuf::from("/nonexistent/imageless.sock"));
+        prepare.runtime_log = Some(log.clone());
+
+        let error = prepare_bundle(&prepare).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let message = relayed_lines(&log)[0]["msg"].as_str().unwrap().to_string();
+        assert!(
+            message.starts_with("imageless: spec_conflict: "),
+            "{message}"
+        );
+    }
+
+    /// The other half of that arm: a `config.json` that will not parse is the
+    /// node's problem, names node paths, and does not even establish that the
+    /// bundle was imageless. It must not reach a tenant-visible channel.
+    #[test]
+    fn an_unreadable_config_is_not_relayed_to_the_tenant() {
+        let directory = temporary("relay-unreadable");
+        let bundle = directory.join("bundle");
+        std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        let config = bundle.join("config.json");
+        std::fs::write(&config, b"{ this is not json").unwrap();
+        let log = directory.join("runtime.log");
+
+        let mut prepare = PrepareBundle::new(&config, &bundle);
+        prepare.runtime_log = Some(log.clone());
+
+        let error = prepare_bundle(&prepare).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            !log.exists(),
+            "a node-side parse failure is not tenant news"
+        );
+    }
+
+    /// SPEC §4.1 makes passthrough a strict no-op, and a log line is
+    /// observable. A bundle that is not imageless returns before the relay can
+    /// reach it — asserted here against the seam rather than the helper.
+    #[test]
+    fn a_passthrough_bundle_leaves_the_runtime_log_untouched() {
+        let directory = temporary("relay-passthrough");
+        let bundle = directory.join("bundle");
+        std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        let config = bundle.join("config.json");
+        std::fs::write(
+            &config,
+            br#"{"ociVersion":"1.0.2","root":{"path":"rootfs"},"annotations":{}}"#,
+        )
+        .unwrap();
+        let log = directory.join("runtime.log");
+
+        let mut prepare = PrepareBundle::new(&config, &bundle);
+        // A materializer that cannot possibly succeed: reaching it at all would
+        // be the bug this test exists to catch.
+        prepare.materializer =
+            MaterializerConfig::Socket(PathBuf::from("/nonexistent/imageless.sock"));
+        prepare.runtime_log = Some(log.clone());
+
+        assert!(prepare_bundle(&prepare).unwrap().is_none());
+        assert!(!log.exists(), "passthrough must write nothing at all");
+    }
 
     #[test]
     fn materializer_selection_follows_the_environment() {
