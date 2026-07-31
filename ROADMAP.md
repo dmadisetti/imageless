@@ -58,8 +58,16 @@ of arriving alongside the core the way they did in the incubation repo.
       offline checks, policy and reference, that need no cluster at all.
       Evaluation happens on the node, under node policy — the client stays
       Nix-free.
-- [ ] Documented dev-cluster quickstart (kind/k3d) so the plugin has a
-      five-minute path from nothing to a running flake.
+- [x] **Documented dev-cluster quickstart (kind).** `dev/kind/` takes a host
+      with Docker from nothing to a flake serving HTTP on Kubernetes, and the
+      walkthrough is executed rather than asserted: every step — including the
+      plugin's pack/push/apply path and the node-side `nix-store --gc`, which
+      live containers survive — verified end to end against kind 0.31 /
+      containerd 2.2.0. k3d/k3s stays deferred for the reason
+      `dev/kind/README.md` records: k3s regenerates containerd's config on
+      every start and the correct template variant depends on the release's
+      containerd generation, which doubles the document for zero additional
+      coverage of the seam being demonstrated.
 - [x] **No hand-typed digests.** Optional catalog name/channel index
       (`refs/<name>/<channel>` → digest, client-side only; nodes ignore it)
       plus `kubectl imageless pin <issuer>/<name>` and pin-on-apply

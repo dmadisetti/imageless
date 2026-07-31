@@ -69,16 +69,25 @@ shim binary, the policy file have no API representation — so it reports
 
 ```sh
 nix build .#nginx-embedded-image
-zcat -f result > /tmp/imageless-seed.tar
-kind load image-archive /tmp/imageless-seed.tar --name imageless
+zcat -f result | docker exec -i imageless-control-plane \
+  ctr --namespace k8s.io images import -
 ```
 
-Expected: `Image: "localhost/imageless-nginx-embedded:e2e" ... loaded`. The
+Expected: a `saved` line naming
+`localhost/imageless-nginx-embedded:e2e`, then `Importing ... elapsed`. The
 image is a few kilobytes: its only contents are
 `examples/nginx-embedded/{flake.nix,flake.lock}` at `etc/imageless/`. The
 `zcat` matters — `dockerTools.buildImage` emits a gzipped archive and the
-node's containerd import wants a plain tar (the same pipeline the CRI VM
-smoke uses).
+node's containerd import wants a plain tar.
+
+Not `kind load image-archive`, which fails here. `kind load` invokes `ctr
+images import --all-platforms`, and `dockerTools.buildImage` emits a legacy
+Docker v1 archive — `manifest.json` plus a layer directory, no `index.json`
+and no platform descriptor anywhere. containerd 2.x finds nothing to unpack
+and refuses with `no unpack platforms defined`. Importing without
+`--all-platforms` is exactly what the CRI VM gate does
+(`smoke/imageless-cri-smoke.sh`), which is why that gate stays green on an
+archive this step could not load.
 
 ## 4. Run it
 
@@ -104,11 +113,27 @@ curl -s http://127.0.0.1:18080/   # => imageless-nginx-ok
 docker exec imageless-control-plane ctr -n k8s.io images ls | grep nginx-embedded
 ```
 
-The image the node holds is a few kilobytes and contains no nginx — the
-filesystem serving that response was materialized on the node from the
-embedded flake at container-create, GC-rooted per bundle. `kubectl exec`
-into the pod and look around: the rootfs is the flake's `#rootfs` output,
-read-only, with `/nix/store` bound alongside it.
+The image the node holds is ~11 KiB and contains no nginx: its entire payload
+is `etc/imageless/flake.nix` and `etc/imageless/flake.lock`. The filesystem
+serving that response was materialized on the node from that flake at
+container-create.
+
+`kubectl exec` into this pod does not work, and that is the demonstration
+rather than a defect — the rootfs is the flake's `#rootfs` output, which
+carries nginx and nothing else, so there is no shell to exec into. To see the
+materialization, look at the GC root the runtime registered for the bundle:
+
+```sh
+docker exec imageless-control-plane sh -c \
+  'for l in /nix/var/nix/gcroots/auto/*; do
+     t=$(readlink "$l"); echo "$t -> $(readlink "$t")"
+   done'
+```
+
+Each live container has one indirect root pointing at its bundle's
+`.imageless-rootfs-gcroot`, which resolves to the store path serving as its
+root filesystem. That indirection is the guarantee: `nix-store --gc` on the
+node cannot collect a rootfs while a container is using it.
 
 ## 6. Author your own, with the kubectl plugin
 
@@ -116,20 +141,60 @@ Steps 3 and 4 load a seed image built by Nix. `kubectl imageless run` does
 the same job for an arbitrary directory, with no Nix and no Docker on the
 client — it packs, pushes, and prints the pod:
 
+The plugin pushes to a registry, so the node needs one it can pull from.
+`localhost:5001` on the client is not `localhost:5001` inside the node — that
+is the node container's own loopback — so the node needs a mirror entry
+pointing at the registry over kind's network. Nothing here touches
+`kind-config.yaml`: kind already sets containerd's registry `config_path`, and
+`certs.d` is read per-pull, so this needs no cluster recreation.
+
+```sh
+docker run -d --name kind-registry --restart=always \
+  -p 127.0.0.1:5001:5000 registry:2
+docker network connect kind kind-registry
+
+docker exec imageless-control-plane mkdir -p /etc/containerd/certs.d/localhost:5001
+docker exec -i imageless-control-plane \
+  sh -c 'cat > /etc/containerd/certs.d/localhost:5001/hosts.toml' <<'EOF'
+[host."http://kind-registry:5000"]
+  capabilities = ["pull", "resolve"]
+EOF
+```
+
+Then pack, push, and apply:
+
 ```sh
 nix build .#kubectl-imageless
 
-# A registry the node can pull from. kind's own is the usual choice:
-#   https://kind.sigs.k8s.io/docs/user/local-registry/
 ./result/bin/kubectl-imageless run examples/nginx-embedded \
   --repo localhost:5001/team/nginx --name my-nginx \
-  -- /bin/nginx -c /etc/nginx/nginx.conf -g 'daemon off;' \
+  -- /bin/nginx -e /proc/self/fd/2 -c /etc/nginx/nginx.conf \
   | kubectl apply -f -
 ```
 
-`localhost:5001` needs no flags: loopback registries are pushed over plain
+Expected: `pushed localhost:5001/team/nginx@sha256:…`, then the pod reaches
+`Running` and serves the same `imageless-nginx-ok` on port 18080.
+
+The command matters. `nginx-embedded`'s own `nginx.conf` already sets
+`daemon off;`, so adding `-g 'daemon off;'` makes nginx exit 1 at startup with
+`"daemon" directive is duplicate` — a container that pulls, creates, and starts
+before dying, which looks nothing like an imageless problem and is not one.
+
+`localhost:5001` needs no push flags: loopback registries are pushed over plain
 HTTP automatically. The pod that lands references the image by digest, never
-by tag. Two caveats worth knowing before pointing this at a shared registry:
+by tag.
+
+One thing worth understanding about what lands. The plugin annotates the pod
+`run.imageless.source: /etc/imageless`, which is the *development* family — and
+`kind-config.yaml` allow-lists only `imageless.run/*`, so containerd strips it
+before the shim ever sees it. The pod works anyway, because with no source
+annotation the shim falls back to zero-config discovery and finds the very same
+`etc/imageless/flake.nix` the annotation was pointing at. The redundancy is
+load-bearing here; do not read this working pod as evidence that the
+development annotation family is allow-listed on this cluster. It is not, which
+is exactly why `--external` below cannot work.
+
+Two caveats worth knowing before pointing this at a shared registry:
 
 - Registries that garbage-collect untagged manifests (GHCR's cleanup
   actions, ECR lifecycle rules with `tagStatus: untagged`) will eventually
@@ -165,12 +230,19 @@ reference would be admitted before you find out from a stuck pod.
   store; nothing was installed on the host).
 - The node's `/nix` grows on the Docker data-root (pinned nixpkgs plus the
   workload closures, a few hundred MB for the nginx demo). Safe cleanup is
-  node-side GC — `docker exec imageless-control-plane
-  /usr/local/bin/imageless-runc --help >/dev/null; docker exec
-  imageless-control-plane sh -c 'PATH=/nix/var/nix/gcroots/imageless-runc/bin:$PATH
-  nix-store --gc'` — which honors the per-bundle roots of live containers
-  and the shim's own root. Do not `docker system prune` your way out while
-  the cluster exists.
+  node-side GC, which honors the per-bundle roots of live containers and the
+  shim's own root:
+
+  ```sh
+  docker exec imageless-control-plane \
+    /nix/var/nix/gcroots/imageless-nix/bin/nix-store --gc
+  ```
+
+  That path is a GC root `setup.sh` registers for exactly this reason. It is
+  *not* interchangeable with `imageless-runc`'s root: the shim and the Nix it
+  drives are separate closures, and `.#imageless`'s `bin/` carries the four
+  imageless binaries and no `nix-store`. Do not `docker system prune` your way
+  out while the cluster exists.
 - Re-running `setup.sh` after rebuilding `.#imageless` refreshes the node
   store from a fresh staging copy; store paths the node materialized on its
   own are forgotten by the imported db, so treat a re-run as node re-init
