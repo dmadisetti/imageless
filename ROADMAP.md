@@ -126,8 +126,25 @@ runtime contract:
 
 - a release *publisher* product (any CI that copies a closure and emits the
   manifest JSON conforms — that is the point of the manifest);
-- Garnix-style recursive FOD verification, incremental build retention,
-  SBOM/SLSA emission, hardware-attested builders;
+- Garnix-style recursive FOD verification, SBOM/SLSA emission,
+  hardware-attested builders;
+- incremental build retention — a mutable build cache the node keeps across
+  creates. Gated rather than merely unscheduled, and the gate is worth writing
+  down because the obvious objections are not the binding ones. It would need a
+  break glass that clears the cache and a TTL that bounds staleness, plus a size
+  cap, since a TTL bounds age and not disk. Those are the cheap half. The
+  expensive half is that a cache surviving between creates makes the same flake
+  produce different output depending on node state — the one property the
+  digest-addressed contract exists to deny — and makes one tenant's build
+  artifacts an input to another's build, which is poisoning in one direction and
+  disclosure in the other. Partitioning per tenant answers that and removes most
+  of the hit rate that motivated it.
+
+  The alternative needs none of it: a seed flake that builds its dependencies in
+  their own derivation gets the same edit-loop win with the Nix store as the
+  cache, where `nix-collect-garbage` is already the break glass and GC roots are
+  already the TTL. `dev/bench` measures the difference between the two flake
+  shapes, and `dev/bench/README.md` describes the pattern;
 - a containerd TTRPC `Create` wrapper adapter — only worth revisiting if the
   runc seam ever proves insufficient, which no current containerd generation
   suggests;
