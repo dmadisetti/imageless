@@ -78,17 +78,26 @@ of arriving alongside the core the way they did in the incubation repo.
       `channels` argument, so the repo's own helper emits a catalog `pin`
       reads. Examples never show `REPLACE_DIGEST` — they show the pin flow or
       Nix's `.reference` templating. The node contract stays digest-only.
-- [ ] *(stretch)* **Shebang scripts as deployables.** `kubectl imageless run
-      ./script.sh` where the entry file carries a `#!/usr/bin/env nix` +
-      `#!nix shell ... --command <interpreter>` shebang: the packer parses
-      the shebang and *generates* the embedded flake (buildEnv of the named
-      packages + the script as entrypoint) into the seed image. Pure
-      client-side desugaring — the spec and runtime never learn about
-      shebangs. The generated flake pins a vendored nixpkgs rev + narHash
-      and emits a real `flake.lock` (JSON, no Nix required), so shebang
-      deploys are reproducible by default (`--unpinned` opts out). Accepts a
-      single file or a directory whose entry file is shebang'd; supports the
-      `nix shell` shebang grammar first, others only on demand.
+- [x] **Shebang scripts as deployables.** `kubectl imageless run ./script.sh`
+      where the file carries a `#!/usr/bin/env nix` + `#! nix shell …
+      --command <interpreter>` shebang: the client parses it and *generates* a
+      seed — a flake whose `rootfs` is a `buildEnv` of the named packages, a
+      real `flake.lock`, and the script — then packs and pushes that. Pure
+      client-side desugaring: the spec, the shim, and the node never learn
+      shebangs exist, and the pod they see is the packed-directory pod.
+      Reproducible by default. The client has no Nix and so cannot compute a
+      `narHash`; the lock it writes pins the nixpkgs *this binary was built
+      against*, baked in by `nix/package.nix` from the flake's own input — the
+      same rev `examples/nginx-embedded` pins by hand, so a node that has ever
+      built imageless resolves a generated seed offline. A `cargo`-built plugin
+      has no such pin and says so rather than inventing a hash; `--unpinned`
+      opts out into a `nixos-unstable` seed with no lock, loudly.
+      `--emit-seed DIR` writes the generated tree out, which is the way *out*
+      of this mode: the result is an ordinary seed directory, and nothing about
+      it required the plugin to produce. Two deliberate bounds: a single file
+      (not yet a directory whose entry file is shebang'd), and `nixpkgs#`
+      installables only — a second flake reference would be an input the client
+      cannot lock, which is the property this mode is built on.
 
 ## Spec v1 freeze
 

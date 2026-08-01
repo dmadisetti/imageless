@@ -36,6 +36,56 @@ pub struct PackedLayer {
     pub has_lock: bool,
 }
 
+/// A file the client synthesized rather than read from disk: the `flake.nix`
+/// and `flake.lock` a shebang script desugars into, and the script itself.
+pub struct GeneratedFile {
+    pub name: String,
+    pub mode: u32,
+    pub data: Vec<u8>,
+}
+
+/// Pack a tree the client generated. Same layer shape, same budgets, and the
+/// same determinism rules as [`pack_source`] — the entries just come from
+/// memory, so there is no walk, no symlink to refuse, and no VCS directory to
+/// skip. Everything downstream sees a layer it cannot distinguish from a
+/// packed directory, which is the point: a generated seed is a seed.
+pub fn pack_generated(files: &[GeneratedFile]) -> Result<PackedLayer, String> {
+    let mut sorted: Vec<&GeneratedFile> = files.iter().collect();
+    sorted.sort_by(|left, right| left.name.cmp(&right.name));
+    if let Some(pair) = sorted.windows(2).find(|pair| pair[0].name == pair[1].name) {
+        return Err(format!(
+            "{}: generated twice — a tar with a duplicated name unpacks to whichever copy \
+             happens to land last",
+            pair[0].name
+        ));
+    }
+
+    let mut writer = LayerWriter::default();
+    let mut budget = Budget::default();
+    writer.directory("etc")?;
+    // The tree root is the first charged entry, exactly as in `pack_source`.
+    budget.charge_entry(Path::new(LAYER_ROOT))?;
+    writer.directory(LAYER_ROOT)?;
+    for file in sorted {
+        let path = Path::new(&file.name);
+        budget.charge_entry(path)?;
+        budget.charge_bytes(path, file.data.len() as u64)?;
+        writer.file(
+            &format!("{LAYER_ROOT}/{}", file.name),
+            file.mode,
+            &file.data,
+        )?;
+    }
+    writer.finish();
+    Ok(PackedLayer {
+        tar: writer.tar,
+        entries: budget.entries,
+        bytes: budget.bytes,
+        skipped_vcs: Vec::new(),
+        has_lock: files.iter().any(|file| file.name == "flake.lock"),
+    })
+}
+
 /// Mirror of the node's staging budget: every staged node — the tree root,
 /// each directory, each file — costs one entry before its type is even
 /// considered, and file bytes accrue against the byte bound.

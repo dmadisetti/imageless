@@ -20,9 +20,18 @@
   # builds `.#imageless-dev` with it enabled so a root daemon can be handed a
   # policy through its environment instead of an ownership-checked file.
 , inlinePolicy ? false
+  # The flake input whose rev/narHash `kubectl imageless run <script>` writes
+  # into the flake.lock it generates. The client has no Nix, so the only pin it
+  # can emit is one that was known when this binary was built; pinning to the
+  # same nixpkgs imageless itself locks means any node that has built imageless
+  # already has that input, and a generated seed resolves there offline — the
+  # argument examples/nginx-embedded makes by hand. Null (a plain `cargo build`,
+  # or a caller that has no flake input to offer) leaves the plugin unable to
+  # lock, which it reports rather than guessing a hash.
+, vendoredNixpkgs ? null
 }:
 
-rustPlatform.buildRustPackage {
+rustPlatform.buildRustPackage ({
   pname = if inlinePolicy then "imageless-dev" else "imageless";
   version = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version;
 
@@ -62,4 +71,8 @@ rustPlatform.buildRustPackage {
     platforms = lib.platforms.linux;
     mainProgram = "imageless-runc";
   };
-}
+} // lib.optionalAttrs (vendoredNixpkgs != null) {
+  IMAGELESS_VENDORED_NIXPKGS_REV = vendoredNixpkgs.rev;
+  IMAGELESS_VENDORED_NIXPKGS_NARHASH = vendoredNixpkgs.narHash;
+  IMAGELESS_VENDORED_NIXPKGS_LAST_MODIFIED = toString vendoredNixpkgs.lastModified;
+})

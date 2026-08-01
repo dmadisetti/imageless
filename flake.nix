@@ -23,7 +23,7 @@
       };
 
       overlays.default = final: _prev: {
-        imageless = final.callPackage ./nix/package.nix { };
+        imageless = final.callPackage ./nix/package.nix { vendoredNixpkgs = nixpkgs; };
       };
 
       # Full per-system set, INCLUDING the two NixOS VM acceptance gates. This
@@ -38,13 +38,13 @@
           # The whole workspace in one package: the shim, the optional
           # resolver daemon, and the development evaluator. The NixOS module
           # points every consumer here.
-          imageless = pkgs.callPackage ./nix/package.nix { };
+          imageless = pkgs.callPackage ./nix/package.nix { vendoredNixpkgs = nixpkgs; };
 
           # Same workspace built with the `inline-policy` feature, for the dev
           # Docker harness only (a root daemon reads policy from
           # `IMAGELESS_POLICY_JSON` — see dev/docker/README.md). Never deploy it
           # to a shared node: production `.#imageless` cannot read env policy.
-          imageless-dev = pkgs.callPackage ./nix/package.nix { inlinePolicy = true; };
+          imageless-dev = pkgs.callPackage ./nix/package.nix { inlinePolicy = true; vendoredNixpkgs = nixpkgs; };
 
           # Single-binary views for the quick starts (`nix build .#imageless-runc`).
           binView = name: pkgs.runCommand name

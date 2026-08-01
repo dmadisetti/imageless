@@ -224,6 +224,49 @@ larger trust surface than an image you pushed; `--dry-run` and
 `kubectl imageless doctor --policy … --source …` both tell you whether the
 reference would be admitted before you find out from a stuck pod.
 
+## 7. Deploy a script, with no flake at all
+
+A file whose first lines are a nix shebang needs no seed directory — the plugin
+generates one:
+
+```sh
+cat > hello.py <<'EOF'
+#!/usr/bin/env nix
+#! nix shell nixpkgs#python3 --command python3
+import sys
+print("imageless-shebang-ok", sys.version_info[0])
+EOF
+
+./result/bin/kubectl-imageless run hello.py \
+  --repo localhost:5001/team/hello --name hello-shebang \
+  | kubectl apply -f -
+
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/hello-shebang --timeout=300s
+kubectl logs hello-shebang   # => imageless-shebang-ok 3
+```
+
+No `--` command: the shebang already said what runs, so the pod's command is
+`/bin/python3 /share/imageless/hello.py`. The pod's `restartPolicy` is `Never`,
+which is what makes a script that exits look like success rather than a crash
+loop.
+
+Nothing about this reaches the node. What was pushed is an ordinary seed image
+carrying a generated `flake.nix`, a `flake.lock`, and the script — you can see
+exactly what, and stop using the shebang, with:
+
+```sh
+./result/bin/kubectl-imageless run hello.py --emit-seed ./hello-seed
+cat hello-seed/flake.nix
+```
+
+From there `run ./hello-seed --repo … -- /bin/python3 /share/imageless/hello.py`
+is the step 6 path, and the generated flake is yours to edit. The lock pins the
+same nixpkgs revision the examples do, so the node resolves the flake *input*
+without fetching it again. Expect the first run to be slow anyway: `python3`'s
+closure is about 200 MiB that nothing earlier in this walkthrough put on the
+node, so container-create substitutes it from `cache.nixos.org` the same way
+step 4 warns about. That is what the `--timeout=300s` above is sized for.
+
 ## Cleanup, GC, and re-runs
 
 - Teardown: `kind delete cluster --name imageless` (removes the node and its
