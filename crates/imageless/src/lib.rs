@@ -48,8 +48,16 @@ pub use spec::{expansion_request, plan, validate_source, validate_store_path};
 /// Compiles every Rust block in the repository README as a doc-test, so the
 /// embedding example in the front door cannot drift from this API. Not part of
 /// the crate's rendered documentation — it exists only under `cfg(doctest)`.
+///
+/// `../README.md` is a symlink to the repository README, and reaching it that
+/// way rather than by `../../../README.md` is what keeps this resolvable in a
+/// published tarball: `cargo package` dereferences the link, so the crate ships
+/// the same file at its own root. The out-of-package path would dangle there —
+/// harmless today, since `cfg(doctest)` strips this item before the `include_str!`
+/// is ever expanded, but only until someone runs `cargo test --doc` on a vendored
+/// copy.
 #[cfg(doctest)]
-#[doc = include_str!("../../../README.md")]
+#[doc = include_str!("../README.md")]
 pub struct ReadmeDoctests;
 
 // Daemon wire-protocol bounds: public only with the `daemon` feature — the
