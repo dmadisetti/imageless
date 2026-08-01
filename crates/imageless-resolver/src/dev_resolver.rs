@@ -96,6 +96,12 @@ fn main() {
         .arg(installable)
         .env_clear()
         .env("HOME", "/var/empty")
+        // Routing through the daemon is what lets this run unprivileged, and it
+        // is also why `--option require-sigs` does NOT belong on this command
+        // the way it does on the release realises in `imageless::resolver`: Nix
+        // binds require-sigs to the store when the store is opened, so a client
+        // sending it to a daemon has it parsed and dropped. Adding it here
+        // would read as enforcement while enforcing nothing.
         .env("NIX_REMOTE", "daemon")
         .env(
             "PATH",

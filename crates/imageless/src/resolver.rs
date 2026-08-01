@@ -620,6 +620,13 @@ impl Resolver {
                 let mut command = Command::new(&self.inner.config.nix_store);
                 command.args([OsStr::new("--realise"), store_path.as_ref()]);
                 command.args([OsStr::new("--add-root"), root.as_os_str()]);
+                // Same reasoning as `register_root`: the caller asserts this
+                // path is present, and a fallback fetch must still be signed.
+                command.args([
+                    OsStr::new("--option"),
+                    OsStr::new("require-sigs"),
+                    OsStr::new("true"),
+                ]);
                 command
             }
             Materialize::Flake(_) => unreachable!(),
@@ -919,6 +926,14 @@ impl Resolver {
         if selected.cache.substituter != "file:///nix/store" {
             path_info.args([OsStr::new("--store"), selected.cache.substituter.as_ref()]);
         }
+        // No `require-sigs` here, deliberately: `path-info` reads a cache and
+        // never adds to the store, and the setting only gates what enters one.
+        // The keys below are inert for the same reason — `path-info` never
+        // reaches signature verification, and describes an unsigned path just
+        // as readily as a signed one. `--store` above is what decides which
+        // cache is answering. They are passed anyway so that this call and the
+        // realise it prices out name the same cache the same way; nothing here
+        // is an authorization check, and `inspect` treats it as none.
         if !selected.cache.public_keys.is_empty() {
             path_info.args([
                 OsStr::new("--option"),
@@ -1076,6 +1091,26 @@ impl Resolver {
             OsStr::new("substituters"),
             cache.substituter.as_ref(),
         ]);
+        // SPEC §6 has node policy pin both the substituters a release may come
+        // from and the keys for them, but the second half only means anything
+        // if Nix actually verifies the signature. `require-sigs` is Nix's
+        // default, so on a stock node this changes nothing; it is here for the
+        // node whose operator turned it off for reasons that had nothing to do
+        // with releases.
+        //
+        // CONSTRAINT: this binds only because the resolver runs as root, for
+        // which `store = auto` opens a LocalStore inside this process. Nix
+        // fixes require-sigs on the store object when it is opened, so the same
+        // flag sent to a nix-daemon by a client is parsed and then discarded.
+        command.args([
+            OsStr::new("--option"),
+            OsStr::new("require-sigs"),
+            OsStr::new("true"),
+        ]);
+        // An explicit list REPLACES the node's trusted-public-keys rather than
+        // extending it, so a cache that names keys is verified against exactly
+        // those. Naming none stays legal and means the opposite: verify against
+        // whatever the node already trusts.
         if !cache.public_keys.is_empty() {
             command.args([
                 OsStr::new("--option"),
@@ -1137,6 +1172,18 @@ impl Resolver {
         let mut command = Command::new(&self.inner.config.nix_store);
         command.args([OsStr::new("--realise"), store_path.as_ref()]);
         command.args([OsStr::new("--add-root"), root.as_os_str()]);
+        // Normally inert: the path is already valid, so nothing is substituted
+        // and no signature is looked at. It matters in the case that is not
+        // normal — a collected path, a follower racing the leader — because
+        // this call passes no `substituters` and would fall back to the NODE's,
+        // which are not the release's authorized cache. Refusing an unsigned
+        // fetch is the cheap half of closing that; scoping the substituter is
+        // the other half, and is a larger change than this.
+        command.args([
+            OsStr::new("--option"),
+            OsStr::new("require-sigs"),
+            OsStr::new("true"),
+        ]);
         let stdout = run_command(
             &mut command,
             remaining(deadline, "during GC-root registration")?,
