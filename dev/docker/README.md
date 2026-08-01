@@ -6,6 +6,25 @@ the local counterpart of the hermetic `docker-embedded-smoke` VM gate — no KVM
 required, just Docker. Nothing is installed to `/etc` or `/run`, and nothing
 lands on disk outside this tree: the policy rides the daemon's environment.
 
+## If you only want the test to pass, not a daemon to poke at
+
+```sh
+nix run .#docker-embedded-isolated
+```
+
+That boots a private dockerd with the runtime registered, runs the embedded
+scenario against it, and destroys it — about seven seconds warm, and your own
+Docker never sees the workload. It is this document, automated, and it is what
+you want unless you are debugging the runtime interactively.
+
+Two differences worth knowing. It defaults to the DAEMONLESS profile, where
+`imageless-runc` materializes in-process; pass
+`IMAGELESS_DOCKER_E2E_WORKER_USER=<account>` to exercise the resolver daemon
+with an unprivileged evaluator instead. And because its private daemon runs as
+root and writes its own policy file as root, it uses the **production**
+`.#imageless` build — the ownership check below is satisfied rather than worked
+around, so none of the inline-policy discussion applies to it.
+
 `daemon.json` names the runtime `imageless-runc` (no path), so the daemon
 resolves it from its `PATH` — put the build's `bin` there when you start it.
 The policy is handed to the runtime inline through `IMAGELESS_POLICY_JSON`
