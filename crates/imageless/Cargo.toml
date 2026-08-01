@@ -5,8 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
-description = "Materialize a Nix flake carried in OCI image layers into the container rootfs at create time"
+description ="Materialize a Nix flake carried in OCI image layers into the container rootfs at create time"
 # Both are symlinks to the repository root, so there is one README and one
 # license text rather than two that drift, and `cargo package` dereferences
 # them into real files at the tarball root.

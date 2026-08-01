@@ -481,7 +481,7 @@ Internal / development only:
   before freeze.
 - Extracted from and battle-tested inside
   [Cowboy](https://github.com/dmadisetti/cowboy); now developed standalone at
-  [imageless.run](https://imageless.run).
+  [github.com/dmadisetti/imageless](https://github.com/dmadisetti/imageless).
 
 ---
 
