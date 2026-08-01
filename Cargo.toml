@@ -8,7 +8,12 @@ edition = "2021"
 authors = ["dmadisetti"]
 license = "Apache-2.0"
 repository = "https://github.com/dmadisetti/imageless"
-homepage = "https://imageless.run"
+# No `homepage` until imageless.run serves something. The domain is registered
+# and delegated but publishes no address record, and crates.io renders whatever
+# metadata a version was uploaded with, forever — a Homepage button that fails
+# to resolve is not fixable in the next patch. `imageless.run/*` remains the
+# annotation namespace either way; that is a name, not a URL. Restoring this is
+# one line, and RELEASING.md says so.
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

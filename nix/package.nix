@@ -66,7 +66,10 @@ rustPlatform.buildRustPackage ({
 
   meta = {
     description = "Materialize a Nix flake carried in OCI image layers into the container rootfs at create time";
-    homepage = "https://imageless.run";
+    # The repository, not imageless.run, which resolves to nothing yet. Nix
+    # meta wants a page that exists more than it wants the vanity name, and
+    # unlike the Cargo metadata this is not frozen by anything.
+    homepage = "https://github.com/dmadisetti/imageless";
     license = lib.licenses.asl20;
     platforms = lib.platforms.linux;
     mainProgram = "imageless-runc";

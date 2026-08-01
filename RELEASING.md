@@ -33,6 +33,16 @@ library" — and under lockstep the answer is "the one with the same version"
 rather than a compatibility matrix nobody maintains. It costs a version bump on
 a crate that did not change, which is cheaper than the matrix.
 
+## The homepage field is deliberately absent
+
+`[workspace.package]` carries `repository` but no `homepage`. `imageless.run`
+is registered and delegated but publishes no address record, and a crates.io
+version renders the metadata it was uploaded with forever — a Homepage button
+that fails to resolve cannot be fixed in the next patch, only in the next
+version. When the domain serves something, add the line back; it is one line,
+and the next minor release picks it up. This has nothing to do with the
+`imageless.run/*` annotation namespace, which is a name and not a URL.
+
 ## Cutting a release
 
 1. Edit `[workspace.package] version` in `Cargo.toml`. Nothing else records a
