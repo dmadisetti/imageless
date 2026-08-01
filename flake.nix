@@ -148,6 +148,53 @@
               exec bash ${./crates/imageless-runc/tests/docker-embedded-e2e.sh} "$@"
             '';
           };
+          # Scaffolding for the isolated harness below, not a subject under
+          # test: the smallest image that can cross into the host bind at
+          # /host. Its busybox mounts the private daemon's tmpfs roots and then
+          # chroots into /host, where every binary the test actually exercises
+          # already lives — so nothing else belongs in this layer.
+          docker-helper-image = pkgs.dockerTools.buildImage {
+            name = "localhost/imageless-docker-helper";
+            tag = "e2e";
+            copyToRoot = pkgs.runCommand "imageless-docker-helper-root" { } ''
+              mkdir -p $out/bin
+              cp ${pkgs.pkgsStatic.busybox}/bin/busybox $out/bin/busybox
+              # The only applet Docker resolves through PATH is the `sh` in the
+              # container's argv; the helper spells every other one as
+              # `/bin/busybox NAME`.
+              ln -s busybox $out/bin/sh
+            '';
+            config.Env = [ "PATH=/bin" ];
+          };
+          # The same scenario against a PRIVATE dockerd this harness boots and
+          # destroys: `nix run .#docker-embedded-isolated`. It is
+          # docker-embedded-smoke without the VM — the Docker acceptance path on
+          # a workstation with no KVM, and without the host's daemon ever seeing
+          # the workload. The automated counterpart of dev/docker/README.md.
+          #
+          # A writeShellApplication on purpose. `nix flake check` builds every
+          # package, and building this one only writes and shellchecks a script;
+          # the Docker socket and the privileges are needed at RUN time, which
+          # check never reaches. Keep it that way — do not wrap it in a
+          # runCommand or a VM test that executes it.
+          docker-embedded-isolated = pkgs.writeShellApplication {
+            name = "imageless-docker-embedded-isolated";
+            runtimeInputs = [ pkgs.coreutils pkgs.docker-client pkgs.jq pkgs.procps ];
+            text = ''
+              export IMAGELESS_DOCKER_IMAGE_ARCHIVE=''${IMAGELESS_DOCKER_IMAGE_ARCHIVE:-${docker-embedded-image}}
+              export IMAGELESS_DOCKER_HELPER_ARCHIVE=${docker-helper-image}
+              export IMAGELESS_DOCKERD=${pkgs.docker}/bin/dockerd
+              export IMAGELESS_CONTAINERD_BIN=${pkgs.containerd}/bin
+              # The delegate imageless-runc execs, overriding the path baked in
+              # at build time, so the shim and the interposer agree on one runc.
+              export IMAGELESS_STOCK_RUNC=${pkgs.runc}/bin/runc
+              export IMAGELESS_RESOLVER=${imageless}/bin/imageless-resolver
+              export IMAGELESS_DEV_RESOLVER=${imageless}/bin/imageless-dev-resolver
+              export IMAGELESS_RUNC_CLIENT=${imageless}/bin/imageless-runc
+              export IMAGELESS_DOCKER_SCENARIO=${docker-embedded-scenario}/bin/imageless-docker-embedded-scenario
+              exec bash ${./crates/imageless-runc/tests/docker-embedded-isolated-e2e.sh} "$@"
+            '';
+          };
           # Hermetic VM proof of the DAEMONLESS path: raw Docker, the shim
           # registered as a Docker runtime, node policy from
           # /etc/imageless/policy.json, and no resolver daemon anywhere in
@@ -594,9 +641,9 @@
         in
         {
           inherit imageless imageless-dev imageless-runc imageless-resolver kubectl-imageless;
-          inherit docker-embedded-seed docker-embedded-image docker-passthrough-image placeholder-image;
+          inherit docker-embedded-seed docker-embedded-image docker-passthrough-image placeholder-image docker-helper-image;
           inherit nginx-embedded-seed nginx-embedded-image;
-          inherit docker-embedded-scenario;
+          inherit docker-embedded-scenario docker-embedded-isolated;
           inherit docker-embedded-smoke imageless-cri-vm imageless-cri-vm-containerd1;
           inherit smoke-image smoke-rootfs smoke-release imageless-cri-smoke;
           inherit cri-embedded-seed cri-embedded-image;
