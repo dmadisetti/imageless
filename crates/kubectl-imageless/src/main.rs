@@ -11,18 +11,27 @@
 //! flag alone — never by what the argument looks like or by what exists on
 //! disk, so a trust-model switch can never hinge on the working directory's
 //! contents.
+//!
+//! Within the packed family the argument's *shape* does decide one thing: a
+//! regular file is a shebang script, desugared into a generated seed, and a
+//! directory is a seed already. That is a `stat`, not a guess about spelling,
+//! and both halves push the same kind of image to the same repository — no
+//! trust boundary moves.
 
 mod auth;
 mod catalog;
 mod doctor;
 mod flakeref;
+mod generate;
 mod kubectl;
 mod oci;
 mod pack;
 mod placeholder;
 mod podspec;
 mod registry;
+mod shebang;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -75,10 +84,10 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str =
-    "kubectl imageless — run a directory or a flake reference on an imageless cluster\n\
+    "kubectl imageless — run a directory, a script, or a flake reference on an imageless cluster\n\
      \n\
      Usage:\n\
-     \x20 kubectl imageless run <dir> --repo HOST/REPO [flags] -- COMMAND [ARG...]\n\
+     \x20 kubectl imageless run <dir|script> --repo HOST/REPO [flags] -- COMMAND [ARG...]\n\
      \x20 kubectl imageless run --external <flake-ref> [flags] -- COMMAND [ARG...]\n\
      \x20 kubectl imageless run --release <issuer>/<name>[:channel] --catalog SRC \\\n\
      \x20                       [flags] -- COMMAND [ARG...]\n\
@@ -89,6 +98,17 @@ const USAGE: &str =
      The directory must contain a flake.nix whose output builds the container\n\
      rootfs. It is packed into a seed OCI image under the same bounds the node\n\
      stages it with, so a refusal happens here, with a path, not on the node.\n\
+     \n\
+     Given a file instead, it must carry a nix shebang —\n\
+     \x20 #!/usr/bin/env nix\n\
+     \x20 #! nix shell nixpkgs#python3 --command python3\n\
+     — and the seed is generated from it: a flake whose rootfs is a buildEnv of\n\
+     the named packages plus the script, and a flake.lock pinning the nixpkgs\n\
+     this plugin was built against. The pod runs the interpreter against the\n\
+     script; anything after -- becomes the script's arguments. Nothing about\n\
+     this reaches the node — it receives an ordinary seed, and the generated\n\
+     flake is meant to be committed and edited once the script outgrows a\n\
+     shebang.\n\
      \n\
      With --external nothing is packed: the pod names the flake reference and\n\
      the node evaluates it under node policy (cache_only: false, an allow-listed\n\
@@ -110,7 +130,9 @@ const USAGE: &str =
      \x20 --release             deploy <issuer>/<name>[:channel] instead of packing\n\
      \x20 --catalog SRC         --release only: issuer catalog to resolve the channel\n\
      \x20                       against — an https:// base URL or a local directory\n\
-     \x20 --unpinned            allow an --external reference that pins nothing\n\
+     \x20 --unpinned            allow an --external reference that pins nothing, or a\n\
+     \x20                       generated flake that tracks nixos-unstable instead of\n\
+     \x20                       the pinned nixpkgs\n\
      \x20 --image REF           an image the cluster can already pull (--external and\n\
      \x20                       --release only)\n\
      \x20 --name NAME           pod name (default: derived from the directory, or from\n\
@@ -127,7 +149,10 @@ const USAGE: &str =
      \x20                       manifests\n\
      \x20 --plain-http          push over http:// to a non-loopback registry (localhost,\n\
      \x20                       *.localhost, 127.0.0.1 and [::1] use http automatically)\n\
-     \x20 --dry-run             print digests and the pod manifest; no network";
+     \x20 --dry-run             print digests and the pod manifest; no network\n\
+     \x20 --emit-seed DIR       script only: write the generated seed (flake.nix,\n\
+     \x20                       flake.lock, the script) to DIR and stop — the way out\n\
+     \x20                       of shebang mode once the script outgrows it";
 
 const PIN_USAGE: &str =
     "kubectl imageless pin — resolve a release channel to the digest a node accepts\n\
@@ -334,14 +359,19 @@ enum ParsedRun {
     Run(Box<RunOptions>),
 }
 
-/// What the pod will run. The variant is chosen by `--external` alone: the
-/// parser never stats the argument and never inspects its shape, so `run
-/// github:owner/repo` packs (and fails) rather than quietly shipping a
-/// node-evaluated reference, and a directory genuinely named `github:owner`
-/// still packs.
+/// What the pod will run. The variant is chosen by `--external` and
+/// `--release` alone: the parser never stats the argument and never inspects
+/// its shape, so `run github:owner/repo` packs (and fails) rather than quietly
+/// shipping a node-evaluated reference, and a directory genuinely named
+/// `github:owner` still packs.
+///
+/// `Local` covers both packed shapes — a seed directory and a shebang script —
+/// because telling them apart is a `stat`, and statting is what this parser
+/// does not do. `run_packed` makes that call once, where the error can name the
+/// path that was actually looked at.
 #[cfg_attr(test, derive(Debug))]
 enum Source {
-    Directory(PathBuf),
+    Local(PathBuf),
     External(String),
     /// A release coordinate as typed — `issuer/name[:channel]`. It is resolved
     /// against `--catalog` before the pod is written, so what lands in the
@@ -367,6 +397,10 @@ struct RunOptions {
     tag: Option<String>,
     plain_http: bool,
     dry_run: bool,
+    /// Write the seed a shebang script desugars into, and stop. The escape
+    /// hatch out of this mode: a script that has outgrown a shebang becomes an
+    /// ordinary directory here, with no step that only the plugin can perform.
+    emit_seed: Option<String>,
     command: Vec<String>,
 }
 
@@ -387,6 +421,7 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
     let mut tag = None;
     let mut plain_http = false;
     let mut dry_run = false;
+    let mut emit_seed = None;
     let mut command = Vec::new();
 
     let mut iterator = arguments.iter();
@@ -420,6 +455,18 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
             "--tag" => tag = Some(value("--tag")?),
             "--plain-http" => plain_http = true,
             "--dry-run" => dry_run = true,
+            "--emit-seed" => {
+                let directory = value("--emit-seed")?;
+                // `create_dir_all("")` is an Ok no-op and `Path::new("").join(x)`
+                // is a bare relative name, so an empty value scattered flake.nix,
+                // flake.lock and the script into the cwd and reported success
+                // with a hole where the destination should be. `--emit-seed
+                // "$OUTDIR"` with OUTDIR unset is the way to hit it.
+                if directory.is_empty() {
+                    return Err("--emit-seed needs a directory".to_string());
+                }
+                emit_seed = Some(directory);
+            }
             flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
             positional if source.is_none() => source = Some(positional.to_string()),
             extra => return Err(format!("unexpected argument `{extra}`")),
@@ -445,13 +492,11 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
                     .to_string(),
             );
         }
-        if unpinned {
-            return Err(
-                "--unpinned applies to --external references; a packed directory pins \
-                 its own bytes"
-                    .to_string(),
-            );
-        }
+        // `--unpinned` is not refused here the way `--image` is: in the packed
+        // family it means something for a shebang script, whose generated
+        // flake it un-pins, and nothing for a directory, which pins its own
+        // bytes. Which of the two this is takes a `stat`, so the refusal lives
+        // in `run_packed` — later, but with the path in hand.
     } else if include_vcs {
         return Err(format!(
             "--include-vcs applies to a packed directory; {} packs nothing",
@@ -525,7 +570,7 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
         catalog::parse_coordinate(&source)?;
         Source::Release(source)
     } else {
-        Source::Directory(PathBuf::from(source))
+        Source::Local(PathBuf::from(source))
     };
     if release && catalog.is_none() {
         return Err(
@@ -542,8 +587,14 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
             if external { "--external" } else { "--release" }
         ));
     }
-    if packs && repo.is_none() {
+    if packs && repo.is_none() && emit_seed.is_none() {
         return Err("--repo HOST/REPO is required".to_string());
+    }
+    if emit_seed.is_some() && !packs {
+        return Err(format!(
+            "--emit-seed writes the seed a shebang script generates; {} generates none",
+            if external { "--external" } else { "--release" }
+        ));
     }
     // `--image` pushes nothing, so there is no push target to validate — every
     // check below is about one.
@@ -589,7 +640,11 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
             ));
         }
     }
-    if command.is_empty() {
+    // A shebang script is the one source that names its own entrypoint, and
+    // whether this is one takes a `stat`. The packed family therefore carries
+    // the requirement to `run_packed`, which knows; the reference modes can
+    // still enforce it here, where nothing about the argument is in doubt.
+    if command.is_empty() && !packs {
         return Err(
             "a workload command is required (the materialized rootfs chooses its own layout, \
              so there is no entrypoint to fall back on); pass it after `--`"
@@ -611,13 +666,14 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
         tag,
         plain_http,
         dry_run,
+        emit_seed,
         command,
     })))
 }
 
 fn run(options: &RunOptions) -> ExitCode {
     match &options.source {
-        Source::Directory(directory) => run_packed(options, directory),
+        Source::Local(directory) => run_packed(options, directory),
         Source::External(reference) => run_external(options, reference),
         Source::Release(coordinate) => run_release(options, coordinate),
     }
@@ -709,16 +765,50 @@ fn run_release(options: &RunOptions, coordinate: &str) -> ExitCode {
     })
 }
 
-fn run_packed(options: &RunOptions, directory: &Path) -> ExitCode {
+/// The one place a packed source's shape is decided. A directory is a seed the
+/// author wrote; a regular file is a shebang script this desugars into one.
+fn run_packed(options: &RunOptions, path: &Path) -> ExitCode {
+    let metadata = std::fs::metadata(path);
+    if matches!(&metadata, Ok(metadata) if metadata.is_file()) {
+        return run_script(options, path);
+    }
+    // Only an actual directory earns the "seed directory already" refusal.
+    // Gating on "not a regular file" instead told anyone who mistyped a script
+    // name that their missing file was a seed directory, and — worse —
+    // returned before `packing_failure_hint`, so `run github:owner/repo
+    // --unpinned` lost the `pass --external` line that the same command
+    // without `--unpinned` prints. Everything else falls through to the
+    // packer, whose errors already name the path.
+    if matches!(&metadata, Ok(metadata) if metadata.is_dir()) {
+        for (flag, present) in [
+            ("--unpinned", options.unpinned),
+            ("--emit-seed", options.emit_seed.is_some()),
+        ] {
+            if present {
+                return fail(format!(
+                    "{flag} applies to a shebang script, whose seed this generates; {} is a seed \
+                     directory already",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if options.command.is_empty() {
+        return fail(
+            "a workload command is required (the materialized rootfs chooses its own layout, \
+             so there is no entrypoint to fall back on); pass it after `--`"
+                .to_string(),
+        );
+    }
     let packed = match pack::pack_source(
-        directory,
+        path,
         &pack::PackOptions {
             include_vcs: options.include_vcs,
         },
     ) {
         Ok(packed) => packed,
         Err(error) => {
-            if let Some(hint) = packing_failure_hint(directory) {
+            if let Some(hint) = packing_failure_hint(path) {
                 eprintln!("kubectl-imageless: {error}");
                 eprintln!("{hint}");
                 return ExitCode::FAILURE;
@@ -726,6 +816,7 @@ fn run_packed(options: &RunOptions, directory: &Path) -> ExitCode {
             return fail(error);
         }
     };
+    let directory = path;
     for path in &packed.skipped_vcs {
         eprintln!(
             "notice: skipped version-control directory {} (pass --include-vcs to pack it)",
@@ -771,6 +862,196 @@ fn run_packed(options: &RunOptions, directory: &Path) -> ExitCode {
         output: options.output.as_deref(),
         command: &options.command,
     })
+}
+
+/// Desugar a `nix`-shebang script into a seed and deploy that.
+///
+/// Purely client-side: what leaves here is a seed image carrying a `flake.nix`,
+/// a `flake.lock`, and the script, and from that point on this is the packed
+/// path exactly — same bounds, same push, same pod. The node is never told a
+/// shebang existed, and the generated seed can be committed and hand-edited
+/// afterwards, which is the intended way out of this mode rather than a
+/// loophole in it.
+fn run_script(options: &RunOptions, script: &Path) -> ExitCode {
+    if options.include_vcs {
+        return fail(
+            "--include-vcs applies to a packed directory; a script's seed is generated, not \
+             walked"
+                .to_string(),
+        );
+    }
+    if options.output.is_some() {
+        return fail(
+            "--output selects a flake output; a generated flake has exactly one, `rootfs` — \
+             to build something else, commit the generated seed and edit it"
+                .to_string(),
+        );
+    }
+    let Some(file_name) = script.file_name().and_then(|name| name.to_str()) else {
+        return fail(format!(
+            "{}: file name is not valid UTF-8",
+            script.display()
+        ));
+    };
+    // Charged against the stat size before the read, the way `pack::read_regular`
+    // charges a seed directory's files. Reading first and letting
+    // `pack_generated` refuse afterwards meant the identical bytes that a seed
+    // directory rejects in 0.00s at 3 MB of RSS instead pulled the whole file
+    // into memory twice — once here, once in `without_shebang` — so under a
+    // memory limit the client was SIGKILLed with no diagnostic at all. It also
+    // let `--emit-seed`, which returns before the packer, write out a seed of
+    // any size with no complaint.
+    match std::fs::metadata(script) {
+        Ok(metadata) if metadata.len() > imageless::MAX_STAGED_SOURCE_BYTES => {
+            return fail(format!(
+                "{}: the script exceeds the node's staging bound of {} bytes",
+                script.display(),
+                imageless::MAX_STAGED_SOURCE_BYTES
+            ))
+        }
+        Ok(_) => {}
+        Err(error) => return fail(format!("{}: {error}", script.display())),
+    }
+    let contents = match std::fs::read(script) {
+        Ok(contents) => contents,
+        Err(error) => return fail(format!("{}: {error}", script.display())),
+    };
+    let Ok(text) = std::str::from_utf8(&contents) else {
+        return fail(format!(
+            "{}: not UTF-8 — a seed directory may carry arbitrary bytes, but a shebang has to \
+             be read to be desugared",
+            script.display()
+        ));
+    };
+    if !shebang::is_nix_shebang(text) {
+        return fail(format!(
+            "{}: a packed source is either a directory containing flake.nix or a script whose \
+             first line is a nix shebang (#!/usr/bin/env nix); this is a file that is neither",
+            script.display()
+        ));
+    }
+    let parsed = match shebang::parse(text) {
+        Ok(parsed) => parsed,
+        Err(error) => return fail(format!("{}: {error}", script.display())),
+    };
+    for warning in &parsed.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let system = match generate::nix_system(&options.arch) {
+        Ok(system) => system,
+        Err(error) => return fail(error),
+    };
+
+    let vendored = generate::vendored_pin();
+    let pin =
+        if options.unpinned {
+            eprintln!(
+                "warning: --unpinned: the generated flake tracks the nixos-unstable branch and\n\
+             ships no flake.lock, so two runs of this script can materialize different\n\
+             closures — and nothing recorded here says which one a given pod got"
+            );
+            None
+        } else {
+            match vendored.as_ref() {
+                Some(pin) => Some(pin),
+                // A binary built outside the flake never learned a narHash, and the
+                // client has no Nix with which to compute one. Emitting a lock with
+                // a guessed hash would fail on the node with a hash mismatch; a
+                // lock with no hash at all is not a pin. Say which build this is.
+                None => return fail(
+                    "this build of kubectl-imageless carries no vendored nixpkgs, so it cannot \
+                     write a flake.lock (it was built by cargo rather than by the flake, which \
+                     bakes the rev and narHash in). Use a flake-built plugin, pass --unpinned \
+                     to accept an unlocked seed, or write the seed directory by hand"
+                        .to_string(),
+                ),
+            }
+        };
+
+    let seed = match generate::seed(file_name, text, &parsed, system, pin) {
+        Ok(seed) => seed,
+        Err(error) => return fail(error),
+    };
+    if let Some(directory) = &options.emit_seed {
+        return match write_seed(Path::new(directory), &seed) {
+            Ok(()) => {
+                eprintln!(
+                    "wrote the generated seed to {directory}; `run {directory} --repo …` from \
+                     here on, and the shebang stops mattering"
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(error),
+        };
+    }
+    let packed = match pack::pack_generated(&seed.files) {
+        Ok(packed) => packed,
+        Err(error) => return fail(error),
+    };
+    eprintln!(
+        "generated a seed from {}: nixpkgs#{} in the rootfs, {} runs it",
+        script.display(),
+        parsed.packages.join(", nixpkgs#"),
+        seed.command.join(" ")
+    );
+    eprintln!(
+        "packed {} entries, {} bytes (node bounds: {} entries, {} bytes)",
+        packed.entries,
+        packed.bytes,
+        imageless::MAX_STAGED_SOURCE_ENTRIES,
+        imageless::MAX_STAGED_SOURCE_BYTES
+    );
+    let image = oci::assemble(packed.tar, &options.arch);
+    report_digests(&image);
+    let repo = options
+        .repo
+        .as_deref()
+        .expect("packed mode requires --repo");
+    if !options.dry_run {
+        if let Err(error) = push(options, repo, &image) {
+            return fail(error);
+        }
+    }
+
+    // The pod's command is the generated one; anything after `--` becomes an
+    // argument to the script, which is where a reader would expect it.
+    let mut command = seed.command;
+    command.extend(options.command.iter().cloned());
+    let name = options.name.clone().unwrap_or_else(|| {
+        podspec::sanitize_name(&script.file_stem().unwrap_or_default().to_string_lossy())
+    });
+    emit(&podspec::PodSpec {
+        name: &name,
+        namespace: options.namespace.as_deref(),
+        image: &format!("{repo}@{}", image.manifest_digest),
+        runtime_class: &options.runtime_class,
+        deploy: podspec::Deploy::Source(podspec::EMBEDDED_SOURCE),
+        output: None,
+        command: &command,
+    })
+}
+
+/// Write a generated seed out as a directory. Refuses to overwrite: the point
+/// is to hand a tree over to be edited and committed, and silently replacing
+/// one that has already been edited is the one way this could lose work.
+fn write_seed(directory: &Path, seed: &generate::GeneratedSeed) -> Result<(), String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("{}: {error}", directory.display()))?;
+    for file in &seed.files {
+        let path = directory.join(&file.name);
+        if path.exists() {
+            return Err(format!("{}: already exists", path.display()));
+        }
+    }
+    for file in &seed.files {
+        let path = directory.join(&file.name);
+        std::fs::write(&path, &file.data)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let permissions = std::fs::Permissions::from_mode(file.mode);
+        std::fs::set_permissions(&path, permissions)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Nothing is packed here: the pod names the reference, and the node decides
@@ -948,7 +1229,7 @@ mod tests {
 
     fn directory(options: &RunOptions) -> &Path {
         match &options.source {
-            Source::Directory(directory) => directory,
+            Source::Local(directory) => directory,
             other => panic!("expected a directory, got {other:?}"),
         }
     }
@@ -1069,7 +1350,11 @@ mod tests {
     fn run_requires_repo_command_and_source() {
         let missing_repo = parse(&["./app", "--", "/bin/true"]).unwrap_err();
         assert!(missing_repo.contains("--repo"), "{missing_repo}");
-        let missing_command = parse(&["./app", "--repo", "r.example/app"]).unwrap_err();
+        // A missing command is a packed-family error only once the source has
+        // been stat'd — a shebang script supplies its own — so the parser
+        // enforces it for the reference modes and `run_packed` for the rest.
+        let pinned = format!("github:o/r/{REV}");
+        let missing_command = parse(&["--external", &pinned, "--image", "x"]).unwrap_err();
         assert!(missing_command.contains("command"), "{missing_command}");
         let missing_source = parse(&["--repo", "r.example/app", "--", "/bin/true"]).unwrap_err();
         assert!(
@@ -1167,10 +1452,10 @@ mod tests {
                 vec!["./app", "--repo", "r.example/a", "--image", "x", "--", "/x"],
                 "--image applies to --external",
             ),
-            (
-                vec!["./app", "--repo", "r.example/a", "--unpinned", "--", "/x"],
-                "--unpinned applies to --external",
-            ),
+            // `--unpinned` is deliberately absent from this list: in the
+            // packed family it is meaningful for a shebang script and
+            // meaningless for a directory, and telling those apart is a stat
+            // the parser does not do. `run_packed` refuses it for a directory.
             (
                 vec![
                     "--external",

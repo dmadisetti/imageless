@@ -303,3 +303,129 @@ fn a_release_without_a_catalog_names_what_is_missing() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("--release needs --catalog"), "{stderr}");
 }
+
+/// The generated seed has to be an ordinary seed — that is the whole claim of
+/// shebang mode. So this emits one and then feeds it back through the *packed
+/// directory* path, which knows nothing about shebangs.
+///
+/// `--unpinned` because a `cargo test` binary has no vendored nixpkgs baked in
+/// and refuses to invent a `narHash`; under `nix build` it does, and the lock
+/// contents are covered by the generator's own tests either way.
+#[test]
+fn a_shebang_script_desugars_into_a_seed_the_packer_accepts() {
+    let root = std::env::temp_dir().join(format!(
+        "kubectl-imageless-cli-shebang-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let script_body = "#!/usr/bin/env nix\n\
+                       #! nix shell nixpkgs#python3 --command python3\n\
+                       print('hello')\n";
+    let script = root.join("hello.py");
+    std::fs::write(&script, script_body).unwrap();
+    let emitted = root.join("seed");
+
+    let output = binary()
+        .args(["run", script.to_str().unwrap(), "--unpinned"])
+        .arg("--emit-seed")
+        .arg(&emitted)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let flake = std::fs::read_to_string(emitted.join("flake.nix")).unwrap();
+    assert!(flake.contains("pkgs.\"python3\""), "{flake}");
+    assert!(flake.contains("rootfs ="), "{flake}");
+    // The shebang lines are blanked rather than kept or removed: a `#!`
+    // continuation line is a syntax error in node, and deleting the lines
+    // would renumber every traceback the author reads.
+    let packed = std::fs::read_to_string(emitted.join("hello.py")).unwrap();
+    assert_eq!(packed, "\n\nprint('hello')\n");
+    assert_eq!(packed.lines().count(), script_body.lines().count());
+
+    let repacked = binary()
+        .arg("run")
+        .arg(&emitted)
+        .args([
+            "--repo",
+            "registry.example/team/app",
+            "--dry-run",
+            "--",
+            "/bin/python3",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        repacked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repacked.stderr)
+    );
+    let pod: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(repacked.stdout).unwrap()).unwrap();
+    assert_eq!(pod["kind"], "Pod");
+
+    // The strong form of the claim: packing the script and packing the seed it
+    // emitted are separate code paths — `pack_generated` builds entries from
+    // memory, `pack_source` walks a directory — and they must agree to the
+    // byte. If they ever diverge, `--emit-seed` stops being a faithful account
+    // of what was pushed, which is the only reason it exists.
+    let direct = binary()
+        .args([
+            "run",
+            script.to_str().unwrap(),
+            "--unpinned",
+            "--repo",
+            "registry.example/team/app",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        direct.status.success(),
+        "{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    let layer = |stderr: &[u8]| {
+        String::from_utf8_lossy(stderr)
+            .lines()
+            .find(|line| line.starts_with("layer "))
+            .expect("a layer digest line")
+            .to_string()
+    };
+    assert_eq!(layer(&direct.stderr), layer(&repacked.stderr));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_file_that_is_neither_a_seed_nor_a_shebang_says_so() {
+    let root = std::env::temp_dir().join(format!(
+        "kubectl-imageless-cli-plain-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let script = root.join("plain.sh");
+    std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+
+    let output = binary()
+        .args([
+            "run",
+            script.to_str().unwrap(),
+            "--repo",
+            "registry.example/team/app",
+            "--dry-run",
+            "--",
+            "/bin/sh",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("nix shebang"), "{stderr}");
+    assert!(stderr.contains("flake.nix"), "{stderr}");
+    std::fs::remove_dir_all(root).unwrap();
+}
