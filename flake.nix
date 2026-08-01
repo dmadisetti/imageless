@@ -675,6 +675,31 @@
                 grep -qx "imageless-[^/]*/$f" packaged-files \
                   || { echo "packaged crate is missing $f" >&2; exit 1; }
               done
+              # crates.io resolves a README's relative URLs against the crate's
+              # path in the repository — `path_in_vcs`, which is
+              # `crates/imageless`, not the root. This README reaches the crate
+              # by symlink and is written for the root, so a root-relative link
+              # renders as a 404 on the crate page: the logo did exactly that
+              # until it was made absolute. Absolute is the only form correct in
+              # GitHub, crates.io and docs.rs at once. Checked against the
+              # PACKAGED copy, because that is the byte stream crates.io renders.
+              # The member pattern is quoted and given to tar, not to the shell:
+              # unquoted it is a glob against the build directory, matches
+              # nothing there, and stdenv's nullglob deletes the word — leaving
+              # tar to dump all 15 members and this scan to run over the crate's
+              # Rust sources, where a rustdoc intra-doc link reads as a relative
+              # URL and fails the build blaming a README that is fine.
+              tar xzOf target/package/imageless-*.crate \
+                --wildcards 'imageless-*/README.md' > packaged-readme
+              { grep -oE '\]\([^)]+\)' packaged-readme | sed 's/^](//; s/)$//'
+                grep -oE '(src|href)="[^"]+"' packaged-readme | sed 's/^[a-z]*="//; s/"$//'
+              } | grep -vE '^(https?://|#)' > relative-urls || true
+              if [ -s relative-urls ]; then
+                echo "README.md carries relative URLs; crates.io resolves them" >&2
+                echo "under crates/imageless/ and they would 404 on the crate page:" >&2
+                cat relative-urls >&2
+                exit 1
+              fi
             '';
             installPhase = "touch $out";
           };
