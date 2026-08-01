@@ -30,8 +30,16 @@ rustPlatform.buildRustPackage {
 
   src = lib.fileset.toSource {
     root = ../.;
-    # README.md is compiled as a doc-test (crates/imageless/src/lib.rs).
-    fileset = lib.fileset.unions [ ../Cargo.toml ../Cargo.lock ../crates ../README.md ];
+    # README.md is compiled as a doc-test (crates/imageless/src/lib.rs), and
+    # both it and LICENSE are symlinked into crates/imageless for packaging.
+    # Drop either from the fileset and the link dangles in the sandbox.
+    fileset = lib.fileset.unions [
+      ../Cargo.toml
+      ../Cargo.lock
+      ../crates
+      ../README.md
+      ../LICENSE
+    ];
   };
 
   cargoLock.lockFile = ../Cargo.lock;

@@ -630,8 +630,17 @@
           inherit (pkgs) lib;
           src = lib.fileset.toSource {
             root = ./.;
-            # README.md is compiled as a doc-test (crates/imageless/src/lib.rs).
-            fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./crates ./README.md ];
+            # README.md is compiled as a doc-test (crates/imageless/src/lib.rs),
+            # and both it and LICENSE are symlinked into crates/imageless so the
+            # published tarball carries them. Drop either from the fileset and
+            # the link dangles in the sandbox.
+            fileset = lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./crates
+              ./README.md
+              ./LICENSE
+            ];
           };
           # Workspace-wide gate: fails on any rustfmt drift or clippy warning,
           # and on the library crate becoming unpackageable — publishing is a
@@ -652,6 +661,20 @@
               cargo fmt --check
               cargo clippy --workspace --all-targets --offline -- -D warnings
               cargo package -p imageless --offline --no-verify
+              # Packageable is not the same as publishable: `cargo package`
+              # succeeds happily on a crate that declares Apache-2.0 and ships
+              # no license text, because an SPDX expression carries no bytes
+              # and nothing checks that any file backs it. That is what this
+              # crate did until README.md and LICENSE became entries in the
+              # package directory. Assert the bytes are actually in the tarball.
+              # Listed to a file rather than piped: `grep -q` exits on the first
+              # match, and under stdenv's pipefail tar's resulting EPIPE would
+              # fail the build on success.
+              tar tzf target/package/imageless-*.crate > packaged-files
+              for f in README.md LICENSE; do
+                grep -qx "imageless-[^/]*/$f" packaged-files \
+                  || { echo "packaged crate is missing $f" >&2; exit 1; }
+              done
             '';
             installPhase = "touch $out";
           };

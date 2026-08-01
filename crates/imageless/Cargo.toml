@@ -4,7 +4,25 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Materialize a Nix flake carried in OCI image layers into the container rootfs at create time"
+# Both are symlinks to the repository root, so there is one README and one
+# license text rather than two that drift, and `cargo package` dereferences
+# them into real files at the tarball root.
+#
+# What actually ships the bytes is that these paths are now *entries in the
+# package directory* — not this `readme` key, which only tells crates.io which
+# file to render. Until they existed the manifest named no license file at all
+# (`license.workspace` is an SPDX expression and carries no bytes), which is
+# the whole reason the crate declared Apache-2.0 while shipping none of it.
+readme = "README.md"
+keywords = ["nix", "oci", "container", "runc", "flake"]
+categories = ["virtualization", "development-tools", "os::linux-apis"]
+# No `rust-version`. The only floor this repo can honestly claim is the one it
+# tests, and it tests exactly one toolchain — the flake's. Declaring that as
+# the minimum would lock out consumers the code may well support; researching
+# a real floor is a job for whoever first needs one.
 
 [features]
 # Off by default: a production build cannot read a policy from the environment.
