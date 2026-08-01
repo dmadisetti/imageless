@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/imageless-logo.svg" width="150"
+  <img src="https://raw.githubusercontent.com/dmadisetti/imageless/HEAD/assets/imageless-logo.svg" width="150"
        alt="The imageless logo: a Polaroid photo dissolving into an empty dashed wireframe">
 </p>
 
@@ -32,7 +32,7 @@ imageless is two things, in this order:
 1. **A shim** — `imageless-runc`, a runc-compatible interposer you register as
    a Docker runtime or a containerd `BinaryName`. No custom containerd shim, no
    kubelet changes, no image-format extension.
-2. **A spec** — [SPEC.md](SPEC.md), the contract for embedded flakes,
+2. **A spec** — [SPEC.md](https://github.com/dmadisetti/imageless/blob/HEAD/SPEC.md), the contract for embedded flakes,
    annotations, materialization bounds, atomic rewrite, store projection, and
    GC-root lifecycle. Any OCI runtime can implement it; a Rust library
    (`imageless`) is provided for runtimes that want to link it instead
@@ -71,7 +71,7 @@ stock runc, untouched. Deployer-side overrides (a different source, a different
 output, per-container selection) are annotations only. Naming a *source* — a
 release or an external flake reference — replaces discovery; the output and
 per-container selectors refine whatever was discovered rather than suppressing
-it. See [SPEC.md](SPEC.md) for the annotation set.
+it. See [SPEC.md](https://github.com/dmadisetti/imageless/blob/HEAD/SPEC.md) for the annotation set.
 
 No daemon. The shim materializes in-process by node policy. Multi-tenant
 nodes can instead run the optional `imageless-resolver` daemon (selected via
